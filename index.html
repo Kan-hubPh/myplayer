@@ -43,7 +43,7 @@
 <body>
 <h1>Player Spike</h1>
 <p>Phase 0 test page. Nothing here is sent anywhere. Files you import stay on this device.</p>
-<p id="build">Build v4: three players (previous, current, next), one sound at a time, debounced next/previous</p>
+<p id="build">Build v5: sound never stops between tracks (new track starts before the old one stops), instant lock screen next/previous</p>
 
 <section>
   <h2 style="margin-top:0">1. Environment checks</h2>
@@ -248,9 +248,9 @@ function markCurrent(i) {
    - the src of a slot is only replaced while that slot is not the active one
    - every command carries a generation number, so a slow, older command can never override a newer one */
 const MEM_LIMIT = 90 * 1048576;                    // bigger files are streamed from storage instead of copied into memory
-const slots = [0, 1, 2].map((n) => ({ el: $('a' + n), n, index: -1, token: 0, url: null, readyP: Promise.resolve(true) }));
-let active = null, current = -1, gen = 0, autoNext = true, mem = true, unlockP = null, unlocking = false;
-let dragging = false, lastPos = 0, pending = null, stepTimer = null;
+const slots = [0, 1, 2].map((n) => ({ el: $('a' + n), n, index: -1, token: 0, url: null, ready: false, readyP: Promise.resolve(false) }));
+let active = null, current = -1, wanted = -1, autoNext = true, mem = true;
+let unlockP = null, unlocked = false, unlocking = false, dragging = false, lastPos = 0, loadTimer = null;
 
 function silentWav() {
   const n = 800, buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
@@ -265,8 +265,8 @@ function unlock() {
   if (!unlockP) {
     const s = silentWav();
     unlocking = true;
-    unlockP = Promise.all(slots.map((x) => { x.el.src = s; x.index = -1; return x.el.play().then(() => x.el.pause()).catch((e) => log('unlock failed: ' + e)); }))
-      .then(() => { unlocking = false; log('all audio elements unlocked'); });
+    unlockP = Promise.all(slots.map((x) => { x.el.src = s; x.index = -1; x.ready = false; return x.el.play().then(() => x.el.pause()).catch((e) => log('unlock failed: ' + e)); }))
+      .then(() => { unlocking = false; unlocked = true; log('all audio elements unlocked'); });
   }
   return unlockP;
 }
@@ -275,17 +275,24 @@ async function blobFor(i) {
   const f = await tracks[i].getFile();
   return (mem && f.size <= MEM_LIMIT) ? new Blob([await f.arrayBuffer()], { type: 'audio/flac' }) : f;
 }
+/* Loads track i into slot s (never the active slot). The promise resolves true once the element has its metadata. */
 function startLoad(s, i) {
   s.el.pause();
   const my = ++s.token;
-  s.index = i;
+  s.index = i; s.ready = false;
   s.readyP = (async () => {
     const blob = await blobFor(i);
     if (my !== s.token) return false;
     if (s.url) URL.revokeObjectURL(s.url);
     s.url = URL.createObjectURL(blob);
-    s.el.src = s.url;
-    s.el.load();
+    await new Promise((res) => {
+      const done = () => { s.el.removeEventListener('loadedmetadata', done); clearTimeout(tm); res(); };
+      const tm = setTimeout(done, 4000);               // iOS may not report metadata for an element that has not played: go on anyway
+      s.el.addEventListener('loadedmetadata', done);
+      s.el.src = s.url; s.el.load();
+    });
+    if (my !== s.token) return false;
+    s.ready = true;
     return true;
   })();
   return s.readyP;
@@ -293,9 +300,9 @@ function startLoad(s, i) {
 const slotFor = (i) => slots.find((s) => s.index === i);
 
 function resetPlayer() {
-  clearTimeout(stepTimer); pending = null; gen++;
-  for (const s of slots) { s.el.pause(); s.token++; s.index = -1; }
-  active = null; current = -1;
+  clearTimeout(loadTimer);
+  for (const s of slots) { s.el.pause(); s.token++; s.index = -1; s.ready = false; }
+  active = null; current = -1; wanted = -1;
   $('nowTitle').textContent = 'Nothing playing'; $('nowSub').textContent = '';
   setSeekUI(0); $('tCur').textContent = '0:00'; $('tDur').textContent = '0:00';
   refreshPP();
@@ -307,34 +314,53 @@ function balance() {
   const want = [current, current + 1, current - 1].filter((i) => i >= 0 && i < tracks.length);
   for (const i of want) {
     if (slotFor(i)) continue;
-    const victim = slots.find((s) => s !== active && !want.includes(s.index));
+    const victim = slots.find((s) => s !== active && !want.includes(s.index) && s.index !== wanted);
     if (victim) startLoad(victim, i);
   }
 }
+function pickVictim(j) {
+  const keep = [j - 1, j, j + 1];
+  return slots.find((s) => s !== active && !keep.includes(s.index)) || slots.find((s) => s !== active);
+}
 
-async function goto(j) {
-  const unlocked = unlock();                       // has to be started inside the tap
-  if (j < 0 || j >= tracks.length) return;
-  const g = ++gen;
-  clearTimeout(stepTimer); pending = null;
-  await unlocked;
-  if (g !== gen) return;
-  for (const s of slots) if (!s.el.paused) s.el.pause();
-  let s = slotFor(j);
-  if (!s) {
-    const keep = [j - 1, j, j + 1];
-    s = slots.find((x) => x !== active && !keep.includes(x.index)) || slots.find((x) => x !== active) || slots[0];
-    startLoad(s, j);
-  }
-  current = j; active = s;
-  showNow(j); markCurrent(j); refreshPP();
-  const ok = await s.readyP;
-  if (g !== gen) return;
-  if (!ok || s.index !== j) { log('slot was reused while loading, retrying'); goto(j); return; }
+/* Make before break: the new track is started FIRST and the old one is stopped afterwards, so sound never
+   stops completely. (On iOS a page that makes no sound in the background is suspended within seconds,
+   and then nothing can start any more.) When the target is already loaded the swap happens synchronously,
+   inside the lock screen / tap event that asked for it. If it is not loaded yet, the current track keeps playing. */
+function switchTo(s, j, ended) {
+  const old = active;
   s.el.currentTime = 0;
-  try { await s.el.play(); } catch (e) { if (g === gen) log('play() rejected: ' + e); }
-  if (g !== gen) { s.el.pause(); return; }
-  afterStart();
+  const p = s.el.play();
+  active = s; current = j; wanted = j;
+  if (old && old !== s && !ended) old.el.pause();
+  showNow(j); markCurrent(j); refreshPP();
+  p.then(() => { if (ended) log('next track started'); afterStart(); },
+    (e) => { log('play() rejected: ' + e + ' (track ' + (j + 1) + ')'); refreshPP(); });
+}
+/* move toward `wanted`: swap at once if loaded, otherwise load it (only the latest target) and swap when ready */
+function settle() {
+  if (wanted < 0 || wanted === current) return;
+  const t = slotFor(wanted);
+  if (t && t.ready) { switchTo(t, wanted); return; }
+  clearTimeout(loadTimer);
+  loadTimer = setTimeout(() => {
+    if (wanted < 0 || wanted === current) return;
+    const w = wanted;
+    let x = slotFor(w);
+    if (!x) { x = pickVictim(w); if (!x) return; startLoad(x, w); }
+    x.readyP.then(() => { if (wanted === w) settle(); });
+  }, t ? 0 : 150);                                  // a short wait so a burst of presses loads only the last target
+}
+function goto(j) {
+  const u = unlock();                              // has to be started inside the tap
+  if (j < 0 || j >= tracks.length) return;
+  wanted = j; showNow(j); markCurrent(j);
+  const go = () => {
+    if (wanted !== j) return;
+    if (j === current && active) { active.el.currentTime = 0; if (active.el.paused) active.el.play().catch((e) => log('play() rejected: ' + e)); return; }
+    settle();
+  };
+  if (unlocked) go(); else u.then(go);
 }
 function afterStart() {
   setupMediaSession();
@@ -345,24 +371,22 @@ function afterStart() {
 function showNow(i) {
   const m = metas[i] || { tags: {} };
   $('nowTitle').textContent = m.tags.TITLE || (tracks[i] && tracks[i].name) || '';
-  $('nowSub').textContent = [m.tags.ARTIST, m.tags.ALBUM].filter(Boolean).join(' · ');
+  $('nowSub').textContent = [m.tags.ARTIST, m.tags.ALBUM].filter(Boolean).join(' · ') + (i !== current ? '  (loading…)' : '');
   $('tDur').textContent = m.duration ? fmtT(m.duration) : '0:00';
-  $('tCur').textContent = '0:00'; setSeekUI(0);
+  if (i !== current) { $('tCur').textContent = '0:00'; setSeekUI(0); }
 }
-/* Next / Previous: presses made within 200 ms of each other count as one move to the final track */
+/* Next / Previous (screen buttons and lock screen) */
 function step(d) {
   unlock();
-  if (d < 0 && pending === null && active && active.el.currentTime > 3) {      // like most players: Previous restarts a track that is already running
+  if (d < 0 && wanted === current && active && active.el.currentTime > 3) {      // like most players: Previous restarts a track that is already running
     active.el.currentTime = 0;
     if (active.el.paused) active.el.play().catch((e) => log('play() rejected: ' + e));
     return;
   }
-  const t = (pending !== null ? pending : current) + d;
+  const t = (wanted >= 0 ? wanted : current) + d;
   if (t < 0 || t >= tracks.length) return;
-  pending = t;
-  showNow(t); markCurrent(t);
-  clearTimeout(stepTimer);
-  stepTimer = setTimeout(() => { const x = pending; pending = null; goto(x); }, 200);
+  wanted = t; showNow(t); markCurrent(t);
+  settle();
 }
 function togglePlay(want) {
   if (!active) { if (tracks.length) goto(0); return; }
@@ -371,31 +395,25 @@ function togglePlay(want) {
   if (want) el.play().catch((e) => log('play() rejected: ' + e)); else el.pause();
 }
 function refreshPP() {
-  const playing = slots.some((s) => !s.el.paused);
+  const playing = !!active && !active.el.paused;
   $('pp').textContent = playing ? 'Pause' : 'Play';
   if ('mediaSession' in navigator) { try { navigator.mediaSession.playbackState = playing ? 'playing' : 'paused'; } catch (e) { /* ignore */ } }
 }
 
-/* the active slot reached its end: if the next track is already loaded, start it inside this very event */
+/* the active slot reached its end: start the next track inside this very event if it is already loaded */
 function onEnded(s) {
   if (s !== active) return;
   log('ended track ' + (current + 1));
   refreshPP();
   if (!autoNext || current + 1 >= tracks.length) return;
-  const n = slotFor(current + 1);
-  if (n && n.el.readyState >= 1) {
-    gen++; clearTimeout(stepTimer); pending = null;
-    n.el.currentTime = 0;
-    const pr = n.el.play();
-    active = n; current += 1;
-    pr.then(() => log('next track started'), (e) => log('next play() rejected: ' + e));
-    showNow(current); markCurrent(current);
-    afterStart();
-  } else {
-    log('next track was not ready, loading now');
-    goto(current + 1);
-  }
+  wanted = current + 1;
+  const n = slotFor(wanted);
+  if (n && n.ready) switchTo(n, wanted, true);
+  else { log('next track was not ready, loading now'); showNow(wanted); settle(); }
 }
+/* safety net: if a move to `wanted` got lost, try again; when the page returns, show the real state */
+setInterval(() => { if (wanted >= 0 && wanted !== current && !loadTimer) settle(); }, 2000);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') { refreshPP(); settle(); } });
 
 function setupMediaSession() {
   if (!('mediaSession' in navigator) || current < 0) return;
