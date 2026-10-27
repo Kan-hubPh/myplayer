@@ -1,5 +1,5 @@
 // Caches the app shell so the page opens with no network after the first visit.
-const CACHE = 'spike-v2';
+const CACHE = 'spike-v3';
 const SHELL = ['./', 'index.html', 'worker.js', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png', 'apple-touch-icon.png'];
 
 self.addEventListener('install', (e) => {

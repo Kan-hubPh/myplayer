@@ -18,8 +18,8 @@
   h1 { font-size:22px; margin:0 0 4px; } h2 { font-size:16px; margin:22px 0 8px; }
   p { margin:4px 0; color:var(--dim); }
   section { background:var(--panel); border-radius:10px; padding:12px 14px; margin-top:12px; }
-  button, .btn { background:#fff; color:#000; border:0; border-radius:999px; padding:10px 18px; font-size:15px; font-weight:600; }
-  button.g { background:#2a2a2a; color:#fff; }
+  button, .btn { background:#2a2a2a; color:#fff; border:0; border-radius:999px; padding:10px 18px; font-size:15px; font-weight:600; }
+  button.w, .btn { background:#fff; color:#000; }
   button:disabled { opacity:.45; }
   .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
   table { width:100%; border-collapse:collapse; font-size:14px; }
@@ -30,28 +30,34 @@
   .bar > div { height:100%; width:0; background:var(--green); }
   .track { display:flex; justify-content:space-between; gap:8px; align-items:center; padding:8px 0; border-bottom:0.5px solid #2a2a2a; }
   .track .n { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .track.on .n { color:var(--green); }
-  pre { background:var(--card); border-radius:8px; padding:10px; max-height:220px; overflow:auto; font-size:12px; white-space:pre-wrap; margin:8px 0 0; }
-  input[type=range] { width:100%; accent-color: var(--green); }
-  audio { width:100%; margin-top:8px; }
+  .track.on .t { color:var(--green); }
+  pre { background:var(--card); border-radius:8px; padding:10px; max-height:240px; overflow:auto; font-size:12px; white-space:pre-wrap; margin:8px 0 0; }
   .hide { display:none; }
+  /* seek bar: the whole 44px strip is the touch target, so a tap jumps and a drag scrubs */
+  #seek { position:relative; height:44px; margin-top:10px; touch-action:none; cursor:pointer; -webkit-user-select:none; user-select:none; }
+  #seek .rail { position:absolute; left:0; right:0; top:19px; height:6px; background:#4d4d4d; border-radius:3px; }
+  #seekFill { position:absolute; left:0; top:19px; height:6px; width:0; background:#fff; border-radius:3px; }
+  #seekKnob { position:absolute; top:13px; width:18px; height:18px; margin-left:-9px; background:#fff; border-radius:50%; left:0; }
+  .times { display:flex; justify-content:space-between; font-size:12px; color:var(--dim); }
+  #pp { min-width:96px; }
 </style>
 </head>
 <body>
 <h1>Player Spike</h1>
 <p>Phase 0 test page. Nothing here is sent anywhere. Files you import stay on this device.</p>
+<p id="build">Build v3: two players, preloaded next track, tap-to-seek bar, lock screen next/previous</p>
 
 <section>
   <h2 style="margin-top:0">1. Environment checks</h2>
   <table id="checks"></table>
-  <div class="row" style="margin-top:10px"><button id="recheck" class="g">Run checks again</button><button id="persist" class="g">Ask for persistent storage</button></div>
+  <div class="row" style="margin-top:10px"><button id="recheck">Run checks again</button><button id="persist">Ask for persistent storage</button></div>
 </section>
 
 <section>
   <h2 style="margin-top:0">2. Import files</h2>
-  <p>Choose the FLAC files from the test pack (select all of them at once).</p>
+  <p>Choose FLAC files (select as many as you like at once).</p>
   <div class="row"><label class="btn" for="pick">Choose files</label><input id="pick" class="hide" type="file" multiple accept=".flac,audio/flac,audio/x-flac,audio/*">
-  <button id="clear" class="g">Delete all imported files</button></div>
+  <button id="clear">Delete all imported files</button></div>
   <div class="bar"><div id="bar"></div></div>
   <p id="importStatus">Nothing imported yet.</p>
 </section>
@@ -59,17 +65,21 @@
 <section>
   <h2 style="margin-top:0">3. Library and player</h2>
   <div id="list"><p>No files yet.</p></div>
-  <audio id="audio" controls preload="metadata"></audio>
-  <div class="row" style="margin-top:8px"><button id="prev" class="g">Previous</button><button id="next" class="g">Next</button>
-  <button id="auto" class="g">Auto-play next: on</button></div>
-  <p id="nowInfo"></p>
+  <p id="nowTitle" style="color:var(--text);font-size:16px;margin-top:12px">Nothing playing</p>
+  <p id="nowSub"></p>
+  <div id="seek" role="slider" aria-label="Seek" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div class="rail"></div><div id="seekFill"></div><div id="seekKnob"></div></div>
+  <div class="times"><span id="tCur">0:00</span><span id="tDur">0:00</span></div>
+  <div class="row" style="margin-top:10px"><button id="prev">Previous</button><button id="pp" class="w">Play</button><button id="next">Next</button></div>
+  <div class="row" style="margin-top:8px"><button id="mode">Next track: two players</button><button id="mem">Preload in memory: on</button><button id="auto">Auto-play next: on</button></div>
+  <audio id="a0" preload="auto" playsinline></audio>
+  <audio id="a1" preload="auto" playsinline></audio>
 </section>
 
 <section>
   <h2 style="margin-top:0">4. Event log</h2>
   <p>Lock the screen or switch apps while a track plays, then come back and read this log.</p>
   <pre id="log"></pre>
-  <div class="row" style="margin-top:8px"><button id="copy" class="g">Copy report</button></div>
+  <div class="row" style="margin-top:8px"><button id="copy">Copy report</button></div>
 </section>
 
 <script>
@@ -77,8 +87,7 @@ const $ = (id) => document.getElementById(id);
 const logEl = $('log');
 const t0 = Date.now();
 function log(msg) {
-  const s = ((Date.now() - t0) / 1000).toFixed(1).padStart(6) + 's  ' + msg;
-  logEl.textContent += s + '\n';
+  logEl.textContent += ((Date.now() - t0) / 1000).toFixed(1).padStart(6) + 's  ' + msg + '\n';
   logEl.scrollTop = logEl.scrollHeight;
 }
 const fmtMB = (b) => (b / 1048576).toFixed(1) + ' MB';
@@ -96,8 +105,7 @@ async function runChecks() {
   add('Service worker', reg ? (navigator.serviceWorker.controller ? 'active and controlling' : 'registered, reload once') : 'not registered', reg && navigator.serviceWorker.controller ? 'ok' : 'warn');
   const opfs = !!(navigator.storage && navigator.storage.getDirectory);
   add('Private file storage (OPFS)', opfs ? 'available' : 'missing', opfs ? 'ok' : 'bad');
-  const worker = typeof Worker !== 'undefined';
-  add('Web worker', worker ? 'available' : 'missing', worker ? 'ok' : 'bad');
+  add('Web worker', typeof Worker !== 'undefined' ? 'available' : 'missing', typeof Worker !== 'undefined' ? 'ok' : 'bad');
   const flac = document.createElement('audio').canPlayType('audio/flac');
   add('FLAC playback', flac || 'no', flac ? 'ok' : 'bad');
   add('Media session (lock screen controls)', 'mediaSession' in navigator ? 'available' : 'missing', 'mediaSession' in navigator ? 'ok' : 'warn');
@@ -115,19 +123,20 @@ async function runChecks() {
 }
 $('recheck').onclick = runChecks;
 $('persist').onclick = async () => {
-  try { const r = await navigator.storage.persist(); log('persist() returned ' + r); } catch (e) { log('persist() error ' + e); }
+  try { log('persist() returned ' + await navigator.storage.persist()); } catch (e) { log('persist() error ' + e); }
   runChecks();
 };
+async function logStorage(tag) {
+  try { const e = await navigator.storage.estimate(); log(`storage ${tag || ''}: used ${fmtMB(e.usage || 0)}`); } catch (e) { /* ignore */ }
+}
 
-/* ---------- service worker ---------- */
 if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('sw.js').then(() => log('service worker registered'),
-    (e) => log('service worker failed: ' + e));
+  navigator.serviceWorker.register('sw.js').then(() => log('service worker registered'), (e) => log('service worker failed: ' + e));
   navigator.serviceWorker.addEventListener('controllerchange', runChecks);
 }
 
 /* ---------- 2. import (worker writes into OPFS) ---------- */
-let worker;
+let worker, importStart = 0;
 function getWorker() {
   if (!worker) {
     worker = new Worker('worker.js');
@@ -137,26 +146,20 @@ function getWorker() {
         $('bar').style.width = (100 * m.done / m.total).toFixed(1) + '%';
         $('importStatus').textContent = `Importing ${m.name}  ${fmtMB(m.done)} of ${fmtMB(m.total)}`;
       } else if (m.type === 'done') {
-        const sec = ((Date.now() - importStart) / 1000);
+        const sec = (Date.now() - importStart) / 1000;
         $('bar').style.width = '100%';
-        $('importStatus').textContent = `Imported ${m.count} files, ${fmtMB(m.total)} in ${sec.toFixed(1)} s (${(m.total / 1048576 / sec).toFixed(0)} MB/s).`;
+        $('importStatus').textContent = `Imported ${m.count} files, ${fmtMB(m.total)} in ${sec.toFixed(1)} s (${(m.total / 1048576 / Math.max(sec, 0.001)).toFixed(0)} MB/s).`;
         log(`import done: ${m.count} files, ${fmtMB(m.total)}, ${sec.toFixed(1)} s`);
-        refreshList(); runChecks();
-      } else if (m.type === 'cleared') {
-        log('all files deleted'); refreshList(); runChecks();
-      } else if (m.type === 'removed') {
-        log('deleted ' + m.name); refreshList(); runChecks();
-      } else if (m.type === 'error') {
-        $('importStatus').textContent = 'Import failed: ' + m.message;
-        log('import error: ' + m.message);
-      }
+        refreshList().then(() => { runChecks(); logStorage('after import'); });
+      } else if (m.type === 'cleared') { log('all files deleted'); refreshList(); runChecks();
+      } else if (m.type === 'removed') { log('deleted ' + m.name); refreshList(); runChecks();
+      } else if (m.type === 'error') { $('importStatus').textContent = 'Import failed: ' + m.message; log('import error: ' + m.message); }
     };
     worker.onerror = (e) => log('worker error: ' + e.message);
   }
   return worker;
 }
-let importStart = 0;
-async function importFiles(files) {
+function importFiles(files) {
   const arr = Array.from(files);
   if (!arr.length) return;
   importStart = Date.now();
@@ -166,8 +169,7 @@ async function importFiles(files) {
 $('pick').onchange = (e) => importFiles(e.target.files);
 $('clear').onclick = () => { if (confirm('Delete every imported file from this app?')) getWorker().postMessage({ type: 'clear' }); };
 
-/* ---------- 3. library and player ---------- */
-/* Reads the FLAC header only (stream info, tags, cover) so any FLAC file can be added without a catalogue file. */
+/* ---------- FLAC header reader: stream info, tags, cover ---------- */
 async function parseFlac(file) {
   const buf = await file.slice(0, 3 * 1048576).arrayBuffer();
   const v = new DataView(buf), u8 = new Uint8Array(buf);
@@ -208,7 +210,8 @@ async function parseFlac(file) {
   return out;
 }
 
-let tracks = [], metas = [], current = -1, autoNext = true;
+/* ---------- 3. library ---------- */
+let tracks = [], metas = [], current = -1;
 async function refreshList() {
   const root = await navigator.storage.getDirectory();
   const handles = [];
@@ -224,7 +227,7 @@ async function refreshList() {
     const d = document.createElement('div');
     d.className = 'track' + (i === current ? ' on' : '');
     d.innerHTML = '<div style="display:flex;gap:10px;align-items:center;min-width:0"><img width="44" height="44" style="border-radius:3px;background:#2a2a2a;flex:none" alt="">' +
-      '<div class="n"><div class="t"></div><p class="i" style="font-size:12px;margin:0"></p></div></div><div class="row"><button class="g p">Play</button><button class="g x">Delete</button></div>';
+      '<div class="n"><div class="t"></div><p class="i" style="font-size:12px;margin:0"></p></div></div><div class="row"><button class="p">Play</button><button class="x">Delete</button></div>';
     d.querySelector('.t').textContent = m.tags.TITLE || h.name;
     d.querySelector('.i').textContent = [m.tags.ARTIST, m.tags.ALBUM, m.bits ? `${m.bits}-bit / ${(m.sampleRate / 1000).toFixed(1)} kHz` : null, m.duration ? fmtT(m.duration) : null].filter(Boolean).join(' · ');
     if (m.cover) d.querySelector('img').src = URL.createObjectURL(m.cover); else d.querySelector('img').removeAttribute('src');
@@ -233,40 +236,170 @@ async function refreshList() {
     el.appendChild(d);
   });
 }
-let objectUrl = null;
+function markCurrent() {
+  document.querySelectorAll('#list .track').forEach((d, i) => d.classList.toggle('on', i === current));
+}
+
+/* ---------- player: two audio elements so the next track is already loaded when this one ends ---------- */
+const A = [$('a0'), $('a1')];
+const loaded = [-1, -1], urls = [null, null];
+let active = 0, autoNext = true, dual = true, mem = true, unlockP = null, dragging = false, lastPos = 0;
+
+function silentWav() {
+  const n = 800, buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+  const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  w(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); w(8, 'WAVE'); w(12, 'fmt '); v.setUint32(16, 16, true);
+  v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, 8000, true); v.setUint32(28, 16000, true);
+  v.setUint16(32, 2, true); v.setUint16(34, 16, true); w(36, 'data'); v.setUint32(40, n * 2, true);
+  return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+}
+/* iOS only lets an audio element play later without a tap if it was started by a tap once: do that for both. */
+function unlock() {
+  if (!unlockP) {
+    const s = silentWav();
+    unlockP = Promise.all(A.map((el) => { el.src = s; return el.play().then(() => el.pause()).catch((e) => log('unlock failed: ' + e)); }))
+      .then(() => log('both audio elements unlocked'));
+  }
+  return unlockP;
+}
+
+async function blobFor(i) {
+  const f = await tracks[i].getFile();
+  return mem ? new Blob([await f.arrayBuffer()], { type: 'audio/flac' }) : f;
+}
+async function load(k, i) {
+  if (i < 0 || i >= tracks.length || loaded[k] === i) return;
+  loaded[k] = i;
+  const blob = await blobFor(i);
+  if (loaded[k] !== i) return;
+  if (urls[k]) URL.revokeObjectURL(urls[k]);
+  urls[k] = URL.createObjectURL(blob);
+  A[k].src = urls[k];
+  A[k].load();
+}
+
 async function play(i) {
+  const p = unlock();                       // must start inside the tap
   if (i < 0 || i >= tracks.length) return;
+  await p;
+  const other = 1 - active;
+  A[other].pause();
+  if (!dual) active = 0;
+  else if (loaded[other] === i) active = other;
+  if (loaded[active] !== i) await load(active, i); else A[active].currentTime = 0;
   current = i;
-  const file = await tracks[i].getFile();
-  if (objectUrl) URL.revokeObjectURL(objectUrl);
-  objectUrl = URL.createObjectURL(file);
-  const a = $('audio');
-  a.src = objectUrl;
-  try { await a.play(); log(`playing ${file.name} (${fmtMB(file.size)})`); }
-  catch (e) { log('play() blocked or failed: ' + e); }
-  if ('mediaSession' in navigator) {
-    const m = metas[i] || { tags: {} };
-    navigator.mediaSession.metadata = new MediaMetadata({
-      title: m.tags.TITLE || file.name.replace(/\.[^.]+$/, ''), artist: m.tags.ARTIST || '', album: m.tags.ALBUM || '',
+  try { await A[active].play(); } catch (e) { log('play() rejected: ' + e); }
+  afterStart();
+}
+function afterStart() {
+  const m = metas[current] || { tags: {} };
+  $('nowTitle').textContent = m.tags.TITLE || tracks[current].name;
+  $('nowSub').textContent = [m.tags.ARTIST, m.tags.ALBUM].filter(Boolean).join(' · ');
+  setupMediaSession();
+  if (dual && current + 1 < tracks.length) load(1 - active, current + 1);
+  markCurrent();
+  logStorage('track ' + (current + 1));
+}
+function goNext() { if (current + 1 < tracks.length) play(current + 1); }
+function goPrev() {
+  if (A[active].currentTime > 3 || current === 0) { A[active].currentTime = 0; return; }
+  play(current - 1);
+}
+function togglePlay(want) {
+  const el = A[active];
+  if (!el.src) return;
+  if (want === undefined) want = el.paused;
+  if (want) el.play().catch((e) => log('play() rejected: ' + e)); else el.pause();
+}
+
+/* an element reached its end: if the next track is already loaded, start it in the very same event */
+function onEnded(k) {
+  if (k !== active) return;
+  log('ended track ' + (current + 1));
+  if (!autoNext || current + 1 >= tracks.length) return;
+  const n = 1 - active;
+  if (dual && loaded[n] === current + 1 && A[n].readyState >= 1) {
+    A[n].currentTime = 0;
+    const pr = A[n].play();
+    active = n; current += 1;
+    pr.then(() => log('next track started'), (e) => log('next play() rejected: ' + e));
+    afterStart();
+  } else {
+    log('next track was not preloaded, loading now');
+    play(current + 1);
+  }
+}
+
+function setupMediaSession() {
+  if (!('mediaSession' in navigator)) return;
+  const ms = navigator.mediaSession;
+  const m = metas[current] || { tags: {} };
+  try {
+    ms.metadata = new MediaMetadata({
+      title: m.tags.TITLE || tracks[current].name, artist: m.tags.ARTIST || '', album: m.tags.ALBUM || '',
       artwork: m.cover ? [{ src: URL.createObjectURL(m.cover), sizes: '512x512', type: m.cover.type }] : []
     });
+  } catch (e) { log('metadata failed: ' + e); }
+  const set = (a, fn) => { try { ms.setActionHandler(a, fn); } catch (e) { /* unsupported action */ } };
+  set('play', () => togglePlay(true));
+  set('pause', () => togglePlay(false));
+  set('previoustrack', goPrev);
+  set('nexttrack', goNext);
+  set('seekto', (d) => { if (d && d.seekTime != null) A[active].currentTime = d.seekTime; });
+  set('seekbackward', null);                 // makes iOS show previous/next instead of -10 s / +10 s
+  set('seekforward', null);
+}
+function updatePosition(el) {
+  if (!('mediaSession' in navigator) || !navigator.mediaSession.setPositionState || !isFinite(el.duration)) return;
+  try { navigator.mediaSession.setPositionState({ duration: el.duration, playbackRate: 1, position: Math.min(el.currentTime, el.duration) }); } catch (e) { /* ignore */ }
+}
+
+/* ---------- seek bar: tap anywhere to jump, drag to scrub ---------- */
+const seek = $('seek');
+function setSeekUI(p) {
+  $('seekFill').style.width = (p * 100) + '%';
+  $('seekKnob').style.left = (p * 100) + '%';
+  seek.setAttribute('aria-valuenow', Math.round(p * 100));
+}
+function seekFromEvent(e, commit) {
+  const el = A[active];
+  if (!isFinite(el.duration) || !el.duration) return;
+  const r = seek.getBoundingClientRect();
+  const p = Math.min(Math.max((e.clientX - r.left) / r.width, 0), 1);
+  setSeekUI(p);
+  $('tCur').textContent = fmtT(p * el.duration);
+  const now = Date.now();
+  if (commit || now - lastPos > 120) { lastPos = now; el.currentTime = p * el.duration; }
+}
+seek.addEventListener('pointerdown', (e) => { dragging = true; try { seek.setPointerCapture(e.pointerId); } catch (x) { /* synthetic */ } seekFromEvent(e, true); });
+seek.addEventListener('pointermove', (e) => { if (dragging) seekFromEvent(e, false); });
+seek.addEventListener('pointerup', (e) => { if (dragging) { seekFromEvent(e, true); dragging = false; updatePosition(A[active]); } });
+seek.addEventListener('pointercancel', () => { dragging = false; });
+
+/* ---------- element events ---------- */
+let lastSeekLog = 0;
+A.forEach((el, k) => {
+  el.addEventListener('ended', () => onEnded(k));
+  el.addEventListener('timeupdate', () => {
+    if (k !== active || dragging) return;
+    if (isFinite(el.duration) && el.duration) { setSeekUI(el.currentTime / el.duration); $('tCur').textContent = fmtT(el.currentTime); $('tDur').textContent = fmtT(el.duration); }
+    updatePosition(el);
+  });
+  el.addEventListener('play', () => { if (k === active) $('pp').textContent = 'Pause'; });
+  el.addEventListener('pause', () => { if (k === active) $('pp').textContent = 'Play'; if (el.src && !el.ended) log(`pause (player ${k}) at ${fmtT(el.currentTime)}`); });
+  el.addEventListener('loadedmetadata', () => { if (k === active) $('tDur').textContent = fmtT(el.duration); });
+  for (const ev of ['stalled', 'waiting', 'error']) {
+    el.addEventListener(ev, () => log(`${ev} (player ${k}) at ${fmtT(el.currentTime)}` + (ev === 'error' && el.error ? ' ' + el.error.message : '')));
   }
-  refreshList();
-}
-const a = $('audio');
-a.addEventListener('loadedmetadata', () => { $('nowInfo').textContent = 'Duration ' + fmtT(a.duration); log('loadedmetadata, duration ' + fmtT(a.duration)); });
-a.addEventListener('ended', () => { log('ended'); if (autoNext && current + 1 < tracks.length) play(current + 1); });
-for (const ev of ['pause', 'seeking', 'seeked', 'stalled', 'waiting', 'error', 'suspend']) {
-  a.addEventListener(ev, () => log(ev + (ev === 'error' && a.error ? ' ' + a.error.message : '') + ' at ' + fmtT(a.currentTime)));
-}
-document.addEventListener('visibilitychange', () => log('page ' + document.visibilityState + ', audio ' + (a.paused ? 'paused' : 'playing') + ' at ' + fmtT(a.currentTime)));
-$('prev').onclick = () => play(current - 1);
-$('next').onclick = () => play(current + 1);
+  el.addEventListener('seeked', () => { const n = Date.now(); if (n - lastSeekLog > 800) { lastSeekLog = n; log(`seeked to ${fmtT(el.currentTime)}`); } });
+});
+document.addEventListener('visibilitychange', () => log('page ' + document.visibilityState + ', audio ' + (A[active].paused ? 'paused' : 'playing') + ' at ' + fmtT(A[active].currentTime)));
+$('prev').onclick = () => { unlock(); goPrev(); };
+$('next').onclick = () => { unlock(); goNext(); };
+$('pp').onclick = () => { unlock(); if (current < 0 && tracks.length) play(0); else togglePlay(); };
 $('auto').onclick = () => { autoNext = !autoNext; $('auto').textContent = 'Auto-play next: ' + (autoNext ? 'on' : 'off'); };
-if ('mediaSession' in navigator) {
-  navigator.mediaSession.setActionHandler('previoustrack', () => play(current - 1));
-  navigator.mediaSession.setActionHandler('nexttrack', () => play(current + 1));
-}
+$('mem').onclick = () => { mem = !mem; loaded[0] = loaded[1] = -1; $('mem').textContent = 'Preload in memory: ' + (mem ? 'on' : 'off'); };
+$('mode').onclick = () => { dual = !dual; $('mode').textContent = 'Next track: ' + (dual ? 'two players' : 'one player (swap)'); loaded[1 - active] = -1; log('mode: ' + (dual ? 'two players' : 'one player')); };
 window.addEventListener('online', () => { log('network online'); runChecks(); });
 window.addEventListener('offline', () => { log('network offline'); runChecks(); });
 
@@ -277,7 +410,7 @@ $('copy').onclick = async () => {
 };
 
 runChecks(); refreshList();
-window.__spike = { importFiles, play, refreshList, runChecks, tracks: () => tracks };
+window.__spike = { importFiles, play, refreshList, runChecks, A, state: () => ({ active, current, loaded: loaded.slice(), dual, mem }) };
 </script>
 </body>
 </html>
