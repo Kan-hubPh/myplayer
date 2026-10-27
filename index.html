@@ -20,7 +20,6 @@
   section { background:var(--panel); border-radius:10px; padding:12px 14px; margin-top:12px; }
   button, .btn { background:#2a2a2a; color:#fff; border:0; border-radius:999px; padding:10px 18px; font-size:15px; font-weight:600; }
   button.w, .btn { background:#fff; color:#000; }
-  button:disabled { opacity:.45; }
   .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
   table { width:100%; border-collapse:collapse; font-size:14px; }
   td { padding:5px 0; vertical-align:top; border-bottom:0.5px solid #2a2a2a; }
@@ -31,9 +30,8 @@
   .track { display:flex; justify-content:space-between; gap:8px; align-items:center; padding:8px 0; border-bottom:0.5px solid #2a2a2a; }
   .track .n { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .track.on .t { color:var(--green); }
-  pre { background:var(--card); border-radius:8px; padding:10px; max-height:240px; overflow:auto; font-size:12px; white-space:pre-wrap; margin:8px 0 0; }
+  pre { background:var(--card); border-radius:8px; padding:10px; max-height:260px; overflow:auto; font-size:12px; white-space:pre-wrap; margin:8px 0 0; }
   .hide { display:none; }
-  /* seek bar: the whole 44px strip is the touch target, so a tap jumps and a drag scrubs */
   #seek { position:relative; height:44px; margin-top:10px; touch-action:none; cursor:pointer; -webkit-user-select:none; user-select:none; }
   #seek .rail { position:absolute; left:0; right:0; top:19px; height:6px; background:#4d4d4d; border-radius:3px; }
   #seekFill { position:absolute; left:0; top:19px; height:6px; width:0; background:#fff; border-radius:3px; }
@@ -45,7 +43,7 @@
 <body>
 <h1>Player Spike</h1>
 <p>Phase 0 test page. Nothing here is sent anywhere. Files you import stay on this device.</p>
-<p id="build">Build v3: two players, preloaded next track, tap-to-seek bar, lock screen next/previous</p>
+<p id="build">Build v4: three players (previous, current, next), one sound at a time, debounced next/previous</p>
 
 <section>
   <h2 style="margin-top:0">1. Environment checks</h2>
@@ -70,9 +68,10 @@
   <div id="seek" role="slider" aria-label="Seek" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div class="rail"></div><div id="seekFill"></div><div id="seekKnob"></div></div>
   <div class="times"><span id="tCur">0:00</span><span id="tDur">0:00</span></div>
   <div class="row" style="margin-top:10px"><button id="prev">Previous</button><button id="pp" class="w">Play</button><button id="next">Next</button></div>
-  <div class="row" style="margin-top:8px"><button id="mode">Next track: two players</button><button id="mem">Preload in memory: on</button><button id="auto">Auto-play next: on</button></div>
+  <div class="row" style="margin-top:8px"><button id="mem">Preload in memory: on</button><button id="auto">Auto-play next: on</button></div>
   <audio id="a0" preload="auto" playsinline></audio>
   <audio id="a1" preload="auto" playsinline></audio>
+  <audio id="a2" preload="auto" playsinline></audio>
 </section>
 
 <section>
@@ -211,8 +210,9 @@ async function parseFlac(file) {
 }
 
 /* ---------- 3. library ---------- */
-let tracks = [], metas = [], current = -1;
+let tracks = [], metas = [];
 async function refreshList() {
+  resetPlayer();                                   // the library changed, so every loaded slot is stale
   const root = await navigator.storage.getDirectory();
   const handles = [];
   for await (const h of root.values()) { if (h.kind === 'file') handles.push(h); }
@@ -225,25 +225,32 @@ async function refreshList() {
   tracks.forEach((h, i) => {
     const m = metas[i] || { tags: {} };
     const d = document.createElement('div');
-    d.className = 'track' + (i === current ? ' on' : '');
+    d.className = 'track';
     d.innerHTML = '<div style="display:flex;gap:10px;align-items:center;min-width:0"><img width="44" height="44" style="border-radius:3px;background:#2a2a2a;flex:none" alt="">' +
       '<div class="n"><div class="t"></div><p class="i" style="font-size:12px;margin:0"></p></div></div><div class="row"><button class="p">Play</button><button class="x">Delete</button></div>';
     d.querySelector('.t').textContent = m.tags.TITLE || h.name;
     d.querySelector('.i').textContent = [m.tags.ARTIST, m.tags.ALBUM, m.bits ? `${m.bits}-bit / ${(m.sampleRate / 1000).toFixed(1)} kHz` : null, m.duration ? fmtT(m.duration) : null].filter(Boolean).join(' · ');
     if (m.cover) d.querySelector('img').src = URL.createObjectURL(m.cover); else d.querySelector('img').removeAttribute('src');
-    d.querySelector('.p').onclick = () => play(i);
+    d.querySelector('.p').onclick = () => goto(i);
     d.querySelector('.x').onclick = () => getWorker().postMessage({ type: 'remove', name: h.name });
     el.appendChild(d);
   });
 }
-function markCurrent() {
-  document.querySelectorAll('#list .track').forEach((d, i) => d.classList.toggle('on', i === current));
+function markCurrent(i) {
+  document.querySelectorAll('#list .track').forEach((d, k) => d.classList.toggle('on', k === i));
 }
 
-/* ---------- player: two audio elements so the next track is already loaded when this one ends ---------- */
-const A = [$('a0'), $('a1')];
-const loaded = [-1, -1], urls = [null, null];
-let active = 0, autoNext = true, dual = true, mem = true, unlockP = null, dragging = false, lastPos = 0;
+/* ---------- player engine ----------
+   Three audio elements ("slots") hold the previous, current and next track, so Next and Previous
+   (also from the lock screen) and the automatic jump at the end of a track never need to load
+   anything while the page is in the background. Rules that keep it reliable:
+   - only the active slot may make sound; any other slot that starts playing is stopped at once
+   - the src of a slot is only replaced while that slot is not the active one
+   - every command carries a generation number, so a slow, older command can never override a newer one */
+const MEM_LIMIT = 90 * 1048576;                    // bigger files are streamed from storage instead of copied into memory
+const slots = [0, 1, 2].map((n) => ({ el: $('a' + n), n, index: -1, token: 0, url: null, readyP: Promise.resolve(true) }));
+let active = null, current = -1, gen = 0, autoNext = true, mem = true, unlockP = null, unlocking = false;
+let dragging = false, lastPos = 0, pending = null, stepTimer = null;
 
 function silentWav() {
   const n = 800, buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
@@ -253,87 +260,146 @@ function silentWav() {
   v.setUint16(32, 2, true); v.setUint16(34, 16, true); w(36, 'data'); v.setUint32(40, n * 2, true);
   return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
 }
-/* iOS only lets an audio element play later without a tap if it was started by a tap once: do that for both. */
+/* iOS lets an audio element start later without a tap only if a tap has started it once: do that for every slot. */
 function unlock() {
   if (!unlockP) {
     const s = silentWav();
-    unlockP = Promise.all(A.map((el) => { el.src = s; return el.play().then(() => el.pause()).catch((e) => log('unlock failed: ' + e)); }))
-      .then(() => log('both audio elements unlocked'));
+    unlocking = true;
+    unlockP = Promise.all(slots.map((x) => { x.el.src = s; x.index = -1; return x.el.play().then(() => x.el.pause()).catch((e) => log('unlock failed: ' + e)); }))
+      .then(() => { unlocking = false; log('all audio elements unlocked'); });
   }
   return unlockP;
 }
 
 async function blobFor(i) {
   const f = await tracks[i].getFile();
-  return mem ? new Blob([await f.arrayBuffer()], { type: 'audio/flac' }) : f;
+  return (mem && f.size <= MEM_LIMIT) ? new Blob([await f.arrayBuffer()], { type: 'audio/flac' }) : f;
 }
-async function load(k, i) {
-  if (i < 0 || i >= tracks.length || loaded[k] === i) return;
-  loaded[k] = i;
-  const blob = await blobFor(i);
-  if (loaded[k] !== i) return;
-  if (urls[k]) URL.revokeObjectURL(urls[k]);
-  urls[k] = URL.createObjectURL(blob);
-  A[k].src = urls[k];
-  A[k].load();
+function startLoad(s, i) {
+  s.el.pause();
+  const my = ++s.token;
+  s.index = i;
+  s.readyP = (async () => {
+    const blob = await blobFor(i);
+    if (my !== s.token) return false;
+    if (s.url) URL.revokeObjectURL(s.url);
+    s.url = URL.createObjectURL(blob);
+    s.el.src = s.url;
+    s.el.load();
+    return true;
+  })();
+  return s.readyP;
+}
+const slotFor = (i) => slots.find((s) => s.index === i);
+
+function resetPlayer() {
+  clearTimeout(stepTimer); pending = null; gen++;
+  for (const s of slots) { s.el.pause(); s.token++; s.index = -1; }
+  active = null; current = -1;
+  $('nowTitle').textContent = 'Nothing playing'; $('nowSub').textContent = '';
+  setSeekUI(0); $('tCur').textContent = '0:00'; $('tDur').textContent = '0:00';
+  refreshPP();
 }
 
-async function play(i) {
-  const p = unlock();                       // must start inside the tap
-  if (i < 0 || i >= tracks.length) return;
-  await p;
-  const other = 1 - active;
-  A[other].pause();
-  if (!dual) active = 0;
-  else if (loaded[other] === i) active = other;
-  if (loaded[active] !== i) await load(active, i); else A[active].currentTime = 0;
-  current = i;
-  try { await A[active].play(); } catch (e) { log('play() rejected: ' + e); }
+/* keep the neighbours of the current track loaded in the slots that are not playing */
+function balance() {
+  if (current < 0) return;
+  const want = [current, current + 1, current - 1].filter((i) => i >= 0 && i < tracks.length);
+  for (const i of want) {
+    if (slotFor(i)) continue;
+    const victim = slots.find((s) => s !== active && !want.includes(s.index));
+    if (victim) startLoad(victim, i);
+  }
+}
+
+async function goto(j) {
+  const unlocked = unlock();                       // has to be started inside the tap
+  if (j < 0 || j >= tracks.length) return;
+  const g = ++gen;
+  clearTimeout(stepTimer); pending = null;
+  await unlocked;
+  if (g !== gen) return;
+  for (const s of slots) if (!s.el.paused) s.el.pause();
+  let s = slotFor(j);
+  if (!s) {
+    const keep = [j - 1, j, j + 1];
+    s = slots.find((x) => x !== active && !keep.includes(x.index)) || slots.find((x) => x !== active) || slots[0];
+    startLoad(s, j);
+  }
+  current = j; active = s;
+  showNow(j); markCurrent(j); refreshPP();
+  const ok = await s.readyP;
+  if (g !== gen) return;
+  if (!ok || s.index !== j) { log('slot was reused while loading, retrying'); goto(j); return; }
+  s.el.currentTime = 0;
+  try { await s.el.play(); } catch (e) { if (g === gen) log('play() rejected: ' + e); }
+  if (g !== gen) { s.el.pause(); return; }
   afterStart();
 }
 function afterStart() {
-  const m = metas[current] || { tags: {} };
-  $('nowTitle').textContent = m.tags.TITLE || tracks[current].name;
-  $('nowSub').textContent = [m.tags.ARTIST, m.tags.ALBUM].filter(Boolean).join(' · ');
   setupMediaSession();
-  if (dual && current + 1 < tracks.length) load(1 - active, current + 1);
-  markCurrent();
+  balance();
+  refreshPP();
   logStorage('track ' + (current + 1));
 }
-function goNext() { if (current + 1 < tracks.length) play(current + 1); }
-function goPrev() {
-  if (A[active].currentTime > 3 || current === 0) { A[active].currentTime = 0; return; }
-  play(current - 1);
+function showNow(i) {
+  const m = metas[i] || { tags: {} };
+  $('nowTitle').textContent = m.tags.TITLE || (tracks[i] && tracks[i].name) || '';
+  $('nowSub').textContent = [m.tags.ARTIST, m.tags.ALBUM].filter(Boolean).join(' · ');
+  $('tDur').textContent = m.duration ? fmtT(m.duration) : '0:00';
+  $('tCur').textContent = '0:00'; setSeekUI(0);
+}
+/* Next / Previous: presses made within 200 ms of each other count as one move to the final track */
+function step(d) {
+  unlock();
+  if (d < 0 && pending === null && active && active.el.currentTime > 3) {      // like most players: Previous restarts a track that is already running
+    active.el.currentTime = 0;
+    if (active.el.paused) active.el.play().catch((e) => log('play() rejected: ' + e));
+    return;
+  }
+  const t = (pending !== null ? pending : current) + d;
+  if (t < 0 || t >= tracks.length) return;
+  pending = t;
+  showNow(t); markCurrent(t);
+  clearTimeout(stepTimer);
+  stepTimer = setTimeout(() => { const x = pending; pending = null; goto(x); }, 200);
 }
 function togglePlay(want) {
-  const el = A[active];
-  if (!el.src) return;
+  if (!active) { if (tracks.length) goto(0); return; }
+  const el = active.el;
   if (want === undefined) want = el.paused;
   if (want) el.play().catch((e) => log('play() rejected: ' + e)); else el.pause();
 }
+function refreshPP() {
+  const playing = slots.some((s) => !s.el.paused);
+  $('pp').textContent = playing ? 'Pause' : 'Play';
+  if ('mediaSession' in navigator) { try { navigator.mediaSession.playbackState = playing ? 'playing' : 'paused'; } catch (e) { /* ignore */ } }
+}
 
-/* an element reached its end: if the next track is already loaded, start it in the very same event */
-function onEnded(k) {
-  if (k !== active) return;
+/* the active slot reached its end: if the next track is already loaded, start it inside this very event */
+function onEnded(s) {
+  if (s !== active) return;
   log('ended track ' + (current + 1));
+  refreshPP();
   if (!autoNext || current + 1 >= tracks.length) return;
-  const n = 1 - active;
-  if (dual && loaded[n] === current + 1 && A[n].readyState >= 1) {
-    A[n].currentTime = 0;
-    const pr = A[n].play();
+  const n = slotFor(current + 1);
+  if (n && n.el.readyState >= 1) {
+    gen++; clearTimeout(stepTimer); pending = null;
+    n.el.currentTime = 0;
+    const pr = n.el.play();
     active = n; current += 1;
     pr.then(() => log('next track started'), (e) => log('next play() rejected: ' + e));
+    showNow(current); markCurrent(current);
     afterStart();
   } else {
-    log('next track was not preloaded, loading now');
-    play(current + 1);
+    log('next track was not ready, loading now');
+    goto(current + 1);
   }
 }
 
 function setupMediaSession() {
-  if (!('mediaSession' in navigator)) return;
-  const ms = navigator.mediaSession;
-  const m = metas[current] || { tags: {} };
+  if (!('mediaSession' in navigator) || current < 0) return;
+  const ms = navigator.mediaSession, m = metas[current] || { tags: {} };
   try {
     ms.metadata = new MediaMetadata({
       title: m.tags.TITLE || tracks[current].name, artist: m.tags.ARTIST || '', album: m.tags.ALBUM || '',
@@ -343,10 +409,10 @@ function setupMediaSession() {
   const set = (a, fn) => { try { ms.setActionHandler(a, fn); } catch (e) { /* unsupported action */ } };
   set('play', () => togglePlay(true));
   set('pause', () => togglePlay(false));
-  set('previoustrack', goPrev);
-  set('nexttrack', goNext);
-  set('seekto', (d) => { if (d && d.seekTime != null) A[active].currentTime = d.seekTime; });
-  set('seekbackward', null);                 // makes iOS show previous/next instead of -10 s / +10 s
+  set('previoustrack', () => step(-1));
+  set('nexttrack', () => step(1));
+  set('seekto', (d) => { if (active && d && d.seekTime != null) active.el.currentTime = d.seekTime; });
+  set('seekbackward', null);                       // makes iOS show previous/next instead of -10 s / +10 s
   set('seekforward', null);
 }
 function updatePosition(el) {
@@ -362,7 +428,8 @@ function setSeekUI(p) {
   seek.setAttribute('aria-valuenow', Math.round(p * 100));
 }
 function seekFromEvent(e, commit) {
-  const el = A[active];
+  if (!active) return;
+  const el = active.el;
   if (!isFinite(el.duration) || !el.duration) return;
   const r = seek.getBoundingClientRect();
   const p = Math.min(Math.max((e.clientX - r.left) / r.width, 0), 1);
@@ -373,33 +440,43 @@ function seekFromEvent(e, commit) {
 }
 seek.addEventListener('pointerdown', (e) => { dragging = true; try { seek.setPointerCapture(e.pointerId); } catch (x) { /* synthetic */ } seekFromEvent(e, true); });
 seek.addEventListener('pointermove', (e) => { if (dragging) seekFromEvent(e, false); });
-seek.addEventListener('pointerup', (e) => { if (dragging) { seekFromEvent(e, true); dragging = false; updatePosition(A[active]); } });
+seek.addEventListener('pointerup', (e) => { if (dragging) { seekFromEvent(e, true); dragging = false; if (active) updatePosition(active.el); } });
 seek.addEventListener('pointercancel', () => { dragging = false; });
 
 /* ---------- element events ---------- */
 let lastSeekLog = 0;
-A.forEach((el, k) => {
-  el.addEventListener('ended', () => onEnded(k));
+slots.forEach((s) => {
+  const el = s.el;
+  el.addEventListener('ended', () => onEnded(s));
   el.addEventListener('timeupdate', () => {
-    if (k !== active || dragging) return;
+    if (s !== active || dragging) return;
     if (isFinite(el.duration) && el.duration) { setSeekUI(el.currentTime / el.duration); $('tCur').textContent = fmtT(el.currentTime); $('tDur').textContent = fmtT(el.duration); }
     updatePosition(el);
   });
-  el.addEventListener('play', () => { if (k === active) $('pp').textContent = 'Pause'; });
-  el.addEventListener('pause', () => { if (k === active) $('pp').textContent = 'Play'; if (el.src && !el.ended) log(`pause (player ${k}) at ${fmtT(el.currentTime)}`); });
-  el.addEventListener('loadedmetadata', () => { if (k === active) $('tDur').textContent = fmtT(el.duration); });
-  for (const ev of ['stalled', 'waiting', 'error']) {
-    el.addEventListener(ev, () => log(`${ev} (player ${k}) at ${fmtT(el.currentTime)}` + (ev === 'error' && el.error ? ' ' + el.error.message : '')));
+  el.addEventListener('play', () => {
+    if (!unlocking && s !== active) { el.pause(); log(`stopped a stray player (slot ${s.n})`); }
+    refreshPP();
+  });
+  el.addEventListener('pause', () => { refreshPP(); if (s === active && !el.ended && el.src) log(`pause at ${fmtT(el.currentTime)} (track ${current + 1})`); });
+  el.addEventListener('loadedmetadata', () => { if (s === active) $('tDur').textContent = fmtT(el.duration); });
+  for (const ev of ['stalled', 'error']) {
+    el.addEventListener(ev, () => { if (s === active || ev === 'error') log(`${ev} (slot ${s.n}) at ${fmtT(el.currentTime)}` + (ev === 'error' && el.error ? ' ' + el.error.message : '')); });
   }
-  el.addEventListener('seeked', () => { const n = Date.now(); if (n - lastSeekLog > 800) { lastSeekLog = n; log(`seeked to ${fmtT(el.currentTime)}`); } });
+  el.addEventListener('seeked', () => { if (s !== active) return; const n = Date.now(); if (n - lastSeekLog > 800) { lastSeekLog = n; log(`seeked to ${fmtT(el.currentTime)}`); } });
 });
-document.addEventListener('visibilitychange', () => log('page ' + document.visibilityState + ', audio ' + (A[active].paused ? 'paused' : 'playing') + ' at ' + fmtT(A[active].currentTime)));
-$('prev').onclick = () => { unlock(); goPrev(); };
-$('next').onclick = () => { unlock(); goNext(); };
-$('pp').onclick = () => { unlock(); if (current < 0 && tracks.length) play(0); else togglePlay(); };
+document.addEventListener('visibilitychange', () => {
+  const playing = slots.filter((s) => !s.el.paused).length;
+  log('page ' + document.visibilityState + ', ' + playing + ' player(s) playing' + (active ? ', active at ' + fmtT(active.el.currentTime) : ''));
+});
+$('prev').onclick = () => step(-1);
+$('next').onclick = () => step(1);
+$('pp').onclick = () => { unlock(); togglePlay(); };
 $('auto').onclick = () => { autoNext = !autoNext; $('auto').textContent = 'Auto-play next: ' + (autoNext ? 'on' : 'off'); };
-$('mem').onclick = () => { mem = !mem; loaded[0] = loaded[1] = -1; $('mem').textContent = 'Preload in memory: ' + (mem ? 'on' : 'off'); };
-$('mode').onclick = () => { dual = !dual; $('mode').textContent = 'Next track: ' + (dual ? 'two players' : 'one player (swap)'); loaded[1 - active] = -1; log('mode: ' + (dual ? 'two players' : 'one player')); };
+$('mem').onclick = () => {
+  mem = !mem; $('mem').textContent = 'Preload in memory: ' + (mem ? 'on' : 'off');
+  for (const s of slots) if (s !== active) { s.token++; s.index = -1; }
+  balance();
+};
 window.addEventListener('online', () => { log('network online'); runChecks(); });
 window.addEventListener('offline', () => { log('network offline'); runChecks(); });
 
@@ -410,7 +487,7 @@ $('copy').onclick = async () => {
 };
 
 runChecks(); refreshList();
-window.__spike = { importFiles, play, refreshList, runChecks, A, state: () => ({ active, current, loaded: loaded.slice(), dual, mem }) };
+window.__spike = { importFiles, goto, step, refreshList, runChecks, slots, state: () => ({ current, active: active ? active.n : null, indexes: slots.map((s) => s.index), playing: slots.map((s) => !s.el.paused) }) };
 </script>
 </body>
 </html>
