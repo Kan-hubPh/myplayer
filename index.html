@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<meta name="robots" content="noindex, nofollow">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<title>Player Spike</title>
+<style>
+  :root { --bg:#000; --panel:#121212; --card:#1f1f1f; --text:#fff; --dim:#b3b3b3; --green:#1ed760; --red:#f3727f; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.45 -apple-system,system-ui,Segoe UI,Roboto,sans-serif;
+         padding: max(16px, env(safe-area-inset-top)) 16px max(24px, env(safe-area-inset-bottom)); }
+  h1 { font-size:22px; margin:0 0 4px; } h2 { font-size:16px; margin:22px 0 8px; }
+  p { margin:4px 0; color:var(--dim); }
+  section { background:var(--panel); border-radius:10px; padding:12px 14px; margin-top:12px; }
+  button, .btn { background:#fff; color:#000; border:0; border-radius:999px; padding:10px 18px; font-size:15px; font-weight:600; }
+  button.g { background:#2a2a2a; color:#fff; }
+  button:disabled { opacity:.45; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  table { width:100%; border-collapse:collapse; font-size:14px; }
+  td { padding:5px 0; vertical-align:top; border-bottom:0.5px solid #2a2a2a; }
+  td:first-child { color:var(--dim); width:46%; padding-right:8px; }
+  .ok { color:var(--green); } .bad { color:var(--red); } .warn { color:#ffd166; }
+  .bar { height:6px; background:#333; border-radius:3px; overflow:hidden; margin:8px 0 2px; }
+  .bar > div { height:100%; width:0; background:var(--green); }
+  .track { display:flex; justify-content:space-between; gap:8px; align-items:center; padding:8px 0; border-bottom:0.5px solid #2a2a2a; }
+  .track .n { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .track.on .n { color:var(--green); }
+  pre { background:var(--card); border-radius:8px; padding:10px; max-height:220px; overflow:auto; font-size:12px; white-space:pre-wrap; margin:8px 0 0; }
+  input[type=range] { width:100%; accent-color: var(--green); }
+  audio { width:100%; margin-top:8px; }
+  .hide { display:none; }
+</style>
+</head>
+<body>
+<h1>Player Spike</h1>
+<p>Phase 0 test page. Nothing here is sent anywhere. Files you import stay on this device.</p>
+
+<section>
+  <h2 style="margin-top:0">1. Environment checks</h2>
+  <table id="checks"></table>
+  <div class="row" style="margin-top:10px"><button id="recheck" class="g">Run checks again</button><button id="persist" class="g">Ask for persistent storage</button></div>
+</section>
+
+<section>
+  <h2 style="margin-top:0">2. Import files</h2>
+  <p>Choose the FLAC files from the test pack (select all of them at once).</p>
+  <div class="row"><label class="btn" for="pick">Choose files</label><input id="pick" class="hide" type="file" multiple accept=".flac,audio/flac,audio/x-flac,audio/*">
+  <button id="clear" class="g">Delete all imported files</button></div>
+  <div class="bar"><div id="bar"></div></div>
+  <p id="importStatus">Nothing imported yet.</p>
+</section>
+
+<section>
+  <h2 style="margin-top:0">3. Library and player</h2>
+  <div id="list"><p>No files yet.</p></div>
+  <audio id="audio" controls preload="metadata"></audio>
+  <div class="row" style="margin-top:8px"><button id="prev" class="g">Previous</button><button id="next" class="g">Next</button>
+  <button id="auto" class="g">Auto-play next: on</button></div>
+  <p id="nowInfo"></p>
+</section>
+
+<section>
+  <h2 style="margin-top:0">4. Event log</h2>
+  <p>Lock the screen or switch apps while a track plays, then come back and read this log.</p>
+  <pre id="log"></pre>
+  <div class="row" style="margin-top:8px"><button id="copy" class="g">Copy report</button></div>
+</section>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const logEl = $('log');
+const t0 = Date.now();
+function log(msg) {
+  const s = ((Date.now() - t0) / 1000).toFixed(1).padStart(6) + 's  ' + msg;
+  logEl.textContent += s + '\n';
+  logEl.scrollTop = logEl.scrollHeight;
+}
+const fmtMB = (b) => (b / 1048576).toFixed(1) + ' MB';
+const fmtGB = (b) => (b / 1073741824).toFixed(2) + ' GB';
+const fmtT = (s) => isFinite(s) ? Math.floor(s / 60) + ':' + String(Math.floor(s % 60)).padStart(2, '0') : '-';
+
+/* ---------- 1. checks ---------- */
+async function runChecks() {
+  const rows = [];
+  const add = (k, v, cls) => rows.push(`<tr><td>${k}</td><td class="${cls || ''}">${v}</td></tr>`);
+  add('Secure context (HTTPS)', String(isSecureContext), isSecureContext ? 'ok' : 'bad');
+  const standalone = matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+  add('Running as installed app', standalone ? 'yes' : 'no (open it from the home screen icon)', standalone ? 'ok' : 'warn');
+  const reg = 'serviceWorker' in navigator ? await navigator.serviceWorker.getRegistration() : null;
+  add('Service worker', reg ? (navigator.serviceWorker.controller ? 'active and controlling' : 'registered, reload once') : 'not registered', reg && navigator.serviceWorker.controller ? 'ok' : 'warn');
+  const opfs = !!(navigator.storage && navigator.storage.getDirectory);
+  add('Private file storage (OPFS)', opfs ? 'available' : 'missing', opfs ? 'ok' : 'bad');
+  const worker = typeof Worker !== 'undefined';
+  add('Web worker', worker ? 'available' : 'missing', worker ? 'ok' : 'bad');
+  const flac = document.createElement('audio').canPlayType('audio/flac');
+  add('FLAC playback', flac || 'no', flac ? 'ok' : 'bad');
+  add('Media session (lock screen controls)', 'mediaSession' in navigator ? 'available' : 'missing', 'mediaSession' in navigator ? 'ok' : 'warn');
+  if (navigator.storage && navigator.storage.persisted) {
+    const p = await navigator.storage.persisted();
+    add('Persistent storage granted', p ? 'yes' : 'no', p ? 'ok' : 'warn');
+  }
+  if (navigator.storage && navigator.storage.estimate) {
+    const e = await navigator.storage.estimate();
+    add('Storage used / quota', `${fmtMB(e.usage || 0)} / ${fmtGB(e.quota || 0)}`, (e.quota || 0) > 2e9 ? 'ok' : 'warn');
+  }
+  add('Network', navigator.onLine ? 'online' : 'offline', '');
+  add('Browser', navigator.userAgent.replace(/\(.*?\)/, '').slice(0, 80), '');
+  $('checks').innerHTML = rows.join('');
+}
+$('recheck').onclick = runChecks;
+$('persist').onclick = async () => {
+  try { const r = await navigator.storage.persist(); log('persist() returned ' + r); } catch (e) { log('persist() error ' + e); }
+  runChecks();
+};
+
+/* ---------- service worker ---------- */
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('sw.js').then(() => log('service worker registered'),
+    (e) => log('service worker failed: ' + e));
+  navigator.serviceWorker.addEventListener('controllerchange', runChecks);
+}
+
+/* ---------- 2. import (worker writes into OPFS) ---------- */
+let worker;
+function getWorker() {
+  if (!worker) {
+    worker = new Worker('worker.js');
+    worker.onmessage = (e) => {
+      const m = e.data;
+      if (m.type === 'progress') {
+        $('bar').style.width = (100 * m.done / m.total).toFixed(1) + '%';
+        $('importStatus').textContent = `Importing ${m.name}  ${fmtMB(m.done)} of ${fmtMB(m.total)}`;
+      } else if (m.type === 'done') {
+        const sec = ((Date.now() - importStart) / 1000);
+        $('bar').style.width = '100%';
+        $('importStatus').textContent = `Imported ${m.count} files, ${fmtMB(m.total)} in ${sec.toFixed(1)} s (${(m.total / 1048576 / sec).toFixed(0)} MB/s).`;
+        log(`import done: ${m.count} files, ${fmtMB(m.total)}, ${sec.toFixed(1)} s`);
+        refreshList(); runChecks();
+      } else if (m.type === 'cleared') {
+        log('all files deleted'); refreshList(); runChecks();
+      } else if (m.type === 'removed') {
+        log('deleted ' + m.name); refreshList(); runChecks();
+      } else if (m.type === 'error') {
+        $('importStatus').textContent = 'Import failed: ' + m.message;
+        log('import error: ' + m.message);
+      }
+    };
+    worker.onerror = (e) => log('worker error: ' + e.message);
+  }
+  return worker;
+}
+let importStart = 0;
+async function importFiles(files) {
+  const arr = Array.from(files);
+  if (!arr.length) return;
+  importStart = Date.now();
+  log(`importing ${arr.length} files (${fmtMB(arr.reduce((a, f) => a + f.size, 0))})`);
+  getWorker().postMessage({ type: 'import', files: arr });
+}
+$('pick').onchange = (e) => importFiles(e.target.files);
+$('clear').onclick = () => { if (confirm('Delete every imported file from this app?')) getWorker().postMessage({ type: 'clear' }); };
+
+/* ---------- 3. library and player ---------- */
+/* Reads the FLAC header only (stream info, tags, cover) so any FLAC file can be added without a catalogue file. */
+async function parseFlac(file) {
+  const buf = await file.slice(0, 3 * 1048576).arrayBuffer();
+  const v = new DataView(buf), u8 = new Uint8Array(buf);
+  const dec = new TextDecoder('utf-8');
+  if (dec.decode(u8.subarray(0, 4)) !== 'fLaC') return null;
+  const out = { tags: {}, cover: null };
+  let p = 4, last = false;
+  while (!last && p + 4 <= buf.byteLength) {
+    const head = v.getUint8(p); last = !!(head & 0x80);
+    const type = head & 0x7f, len = (v.getUint8(p + 1) << 16) | (v.getUint8(p + 2) << 8) | v.getUint8(p + 3);
+    p += 4;
+    if (p + len > buf.byteLength) break;
+    if (type === 0) {
+      const b = (i) => v.getUint8(p + i);
+      out.sampleRate = (b(10) << 12) | (b(11) << 4) | (b(12) >> 4);
+      out.channels = ((b(12) >> 1) & 7) + 1;
+      out.bits = (((b(12) & 1) << 4) | (b(13) >> 4)) + 1;
+      const total = (b(13) & 15) * 4294967296 + ((b(14) << 24) >>> 0) + (b(15) << 16) + (b(16) << 8) + b(17);
+      out.duration = out.sampleRate ? total / out.sampleRate : 0;
+    } else if (type === 4) {
+      let q = p; const vlen = v.getUint32(q, true); q += 4 + vlen;
+      const n = v.getUint32(q, true); q += 4;
+      for (let i = 0; i < n; i++) {
+        const l = v.getUint32(q, true); q += 4;
+        const s = dec.decode(u8.subarray(q, q + l)); q += l;
+        const eq = s.indexOf('=');
+        if (eq > 0) out.tags[s.slice(0, eq).toUpperCase()] = s.slice(eq + 1);
+      }
+    } else if (type === 6 && !out.cover) {
+      let q = p + 4; const ml = v.getUint32(q); q += 4;
+      const mime = dec.decode(u8.subarray(q, q + ml)); q += ml;
+      const dl = v.getUint32(q); q += 4 + dl + 16;
+      const size = v.getUint32(q); q += 4;
+      out.cover = new Blob([u8.slice(q, q + size)], { type: mime || 'image/jpeg' });
+    }
+    p += len;
+  }
+  return out;
+}
+
+let tracks = [], metas = [], current = -1, autoNext = true;
+async function refreshList() {
+  const root = await navigator.storage.getDirectory();
+  const handles = [];
+  for await (const h of root.values()) { if (h.kind === 'file') handles.push(h); }
+  handles.sort((a, b) => a.name.localeCompare(b.name));
+  tracks = handles; metas = [];
+  for (const h of handles) { try { metas.push(await parseFlac(await h.getFile())); } catch (e) { metas.push(null); } }
+  const el = $('list');
+  if (!tracks.length) { el.innerHTML = '<p>No files yet.</p>'; return; }
+  el.innerHTML = '';
+  tracks.forEach((h, i) => {
+    const m = metas[i] || { tags: {} };
+    const d = document.createElement('div');
+    d.className = 'track' + (i === current ? ' on' : '');
+    d.innerHTML = '<div style="display:flex;gap:10px;align-items:center;min-width:0"><img width="44" height="44" style="border-radius:3px;background:#2a2a2a;flex:none" alt="">' +
+      '<div class="n"><div class="t"></div><p class="i" style="font-size:12px;margin:0"></p></div></div><div class="row"><button class="g p">Play</button><button class="g x">Delete</button></div>';
+    d.querySelector('.t').textContent = m.tags.TITLE || h.name;
+    d.querySelector('.i').textContent = [m.tags.ARTIST, m.tags.ALBUM, m.bits ? `${m.bits}-bit / ${(m.sampleRate / 1000).toFixed(1)} kHz` : null, m.duration ? fmtT(m.duration) : null].filter(Boolean).join(' · ');
+    if (m.cover) d.querySelector('img').src = URL.createObjectURL(m.cover); else d.querySelector('img').removeAttribute('src');
+    d.querySelector('.p').onclick = () => play(i);
+    d.querySelector('.x').onclick = () => getWorker().postMessage({ type: 'remove', name: h.name });
+    el.appendChild(d);
+  });
+}
+let objectUrl = null;
+async function play(i) {
+  if (i < 0 || i >= tracks.length) return;
+  current = i;
+  const file = await tracks[i].getFile();
+  if (objectUrl) URL.revokeObjectURL(objectUrl);
+  objectUrl = URL.createObjectURL(file);
+  const a = $('audio');
+  a.src = objectUrl;
+  try { await a.play(); log(`playing ${file.name} (${fmtMB(file.size)})`); }
+  catch (e) { log('play() blocked or failed: ' + e); }
+  if ('mediaSession' in navigator) {
+    const m = metas[i] || { tags: {} };
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: m.tags.TITLE || file.name.replace(/\.[^.]+$/, ''), artist: m.tags.ARTIST || '', album: m.tags.ALBUM || '',
+      artwork: m.cover ? [{ src: URL.createObjectURL(m.cover), sizes: '512x512', type: m.cover.type }] : []
+    });
+  }
+  refreshList();
+}
+const a = $('audio');
+a.addEventListener('loadedmetadata', () => { $('nowInfo').textContent = 'Duration ' + fmtT(a.duration); log('loadedmetadata, duration ' + fmtT(a.duration)); });
+a.addEventListener('ended', () => { log('ended'); if (autoNext && current + 1 < tracks.length) play(current + 1); });
+for (const ev of ['pause', 'seeking', 'seeked', 'stalled', 'waiting', 'error', 'suspend']) {
+  a.addEventListener(ev, () => log(ev + (ev === 'error' && a.error ? ' ' + a.error.message : '') + ' at ' + fmtT(a.currentTime)));
+}
+document.addEventListener('visibilitychange', () => log('page ' + document.visibilityState + ', audio ' + (a.paused ? 'paused' : 'playing') + ' at ' + fmtT(a.currentTime)));
+$('prev').onclick = () => play(current - 1);
+$('next').onclick = () => play(current + 1);
+$('auto').onclick = () => { autoNext = !autoNext; $('auto').textContent = 'Auto-play next: ' + (autoNext ? 'on' : 'off'); };
+if ('mediaSession' in navigator) {
+  navigator.mediaSession.setActionHandler('previoustrack', () => play(current - 1));
+  navigator.mediaSession.setActionHandler('nexttrack', () => play(current + 1));
+}
+window.addEventListener('online', () => { log('network online'); runChecks(); });
+window.addEventListener('offline', () => { log('network offline'); runChecks(); });
+
+/* ---------- 4. report ---------- */
+$('copy').onclick = async () => {
+  const text = Array.from($('checks').rows).map((r) => r.cells[0].textContent + ': ' + r.cells[1].textContent).join('\n') + '\n\n' + logEl.textContent;
+  try { await navigator.clipboard.writeText(text); log('report copied'); } catch (e) { log('copy failed: ' + e); }
+};
+
+runChecks(); refreshList();
+window.__spike = { importFiles, play, refreshList, runChecks, tracks: () => tracks };
+</script>
+</body>
+</html>
