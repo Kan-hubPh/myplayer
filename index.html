@@ -45,7 +45,7 @@
 <body>
 <h1>Player Spike</h1>
 <p>Phase 0 test page. Nothing here is sent anywhere. Files you import stay on this device.</p>
-<p id="build">Build v6: failed track changes never silence the app, recovery after another app takes the audio, audio quality check</p>
+<p id="build">Build v8: reopening continues where you stopped, shows how long iOS keeps the app alive, audio quality check</p>
 
 <section>
   <h2 style="margin-top:0">1. Environment checks</h2>
@@ -241,7 +241,7 @@ async function refreshList() {
     d.querySelector('.t').textContent = m.tags.TITLE || h.name;
     d.querySelector('.i').textContent = [m.tags.ARTIST, m.tags.ALBUM, m.bits ? `${m.bits}-bit / ${(m.sampleRate / 1000).toFixed(1)} kHz` : null, m.duration ? fmtT(m.duration) : null].filter(Boolean).join(' · ');
     if (m.cover) d.querySelector('img').src = URL.createObjectURL(m.cover); else d.querySelector('img').removeAttribute('src');
-    d.querySelector('.p').onclick = () => goto(i);
+    d.querySelector('.p').onclick = () => { restore = null; pendingStartAt = null; goto(i); };
     d.querySelector('.x').onclick = () => getWorker().postMessage({ type: 'remove', name: h.name });
     el.appendChild(d);
   });
@@ -262,6 +262,7 @@ const MEM_LIMIT = 90 * 1048576;                    // bigger files are streamed 
 const slots = [0, 1, 2].map((n) => ({ el: $('a' + n), n, index: -1, token: 0, url: null, ready: false, readyP: Promise.resolve(false) }));
 let active = null, current = -1, wanted = -1, autoNext = true, mem = true;
 let pendingSwitch = null, userPaused = false, interrupted = false, hbCount = 0;
+let restore = null, pendingStartAt = null, lastSave = 0;     // where the last session stopped, so reopening the app can continue there
 const health = { stalls: 0, errors: 0, sysPauses: 0, failedSwitches: 0, interruptions: 0, reloads: 0 };
 function updateHealth() {
   const e = $('health');
@@ -350,7 +351,7 @@ function switchTo(s, j, ended) {
   abortPending();
   const old = active;
   const oldPlaying = !!old && old !== s && !old.el.paused && !ended;
-  s.el.currentTime = 0;
+  s.el.currentTime = startTimeFor(j);
   if (oldPlaying) {
     s.el.muted = true;
     pendingSwitch = { s, j, old, timer: setTimeout(() => failPending('no progress in 2 s'), 2000) };
@@ -446,13 +447,19 @@ function step(d) {
   settle();
 }
 function togglePlay(want) {
-  if (!active) { if (tracks.length) goto(0); return; }
+  if (!active) {
+    if (restore) { const r = restore; restore = null; pendingStartAt = r; goto(r.index); }   // continue where the last session stopped
+    else if (tracks.length) goto(0);
+    return;
+  }
   const el = active.el;
   if (want === undefined) want = el.paused;
   userPaused = !want;
   if (want) {
     if (el.readyState < 2 && active.url) { log('track data was lost while away; reloading before play'); health.reloads++; reloadActive(true); }
     else el.play().catch((e) => log('play() rejected: ' + e));
+    const t0 = el.currentTime;                       // check shortly after that Play really made sound
+    setTimeout(() => log('resume check: ' + (el.paused ? 'STILL PAUSED' : (el.currentTime > t0 + 0.2 ? 'advancing' : 'NOT advancing yet') + ` (readyState=${el.readyState}, hidden=${document.hidden})`)), 1500);
   } else el.pause();
 }
 function refreshPP() {
@@ -488,9 +495,13 @@ function recoverOnReturn() {
   if (!active) return;
   const el = active.el;
   if (interrupted && !userPaused) {
-    log(`back in the app after an interruption: paused=${el.paused}, readyState=${el.readyState}`);
-    if (!el.paused) el.pause();
-    if (el.readyState < 3) reloadActive(false);
+    if (!el.paused) {
+      // iOS resumed the sound by itself when the other app let go: never stop a playback that is already running
+      log(`back in the app: iOS already resumed the playback (readyState=${el.readyState}); leaving it playing`);
+    } else {
+      log(`back in the app after an interruption: paused, readyState=${el.readyState}`);
+      if (el.readyState < 3) reloadActive(false);
+    }
     health.interruptions++;
   }
   interrupted = false; wd.stuck = 0;
@@ -511,6 +522,7 @@ setInterval(() => {
     if (wd.stuck === 6) { log('still not advancing; reloading the track from memory'); health.reloads++; reloadActive(true); }
   }
   if (document.hidden && ++hbCount % 5 === 0 && a) log(`heartbeat (hidden): active at ${fmtT(a.currentTime)}, ${a.paused ? 'paused' : 'playing'}, readyState=${a.readyState}`);
+  try { localStorage.setItem('spike.alive', String(Date.now())); } catch (e) { /* private mode */ }
   updateHealth();
 }, 1000);
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') recoverOnReturn(); });
@@ -571,6 +583,7 @@ slots.forEach((s) => {
   el.addEventListener('timeupdate', () => {
     if (pendingSwitch && pendingSwitch.s === s && el.currentTime > 0.05) commitPending();
     if (s !== active || dragging) return;
+    saveState(false);
     if (isFinite(el.duration) && el.duration) { setSeekUI(el.currentTime / el.duration); $('tCur').textContent = fmtT(el.currentTime); $('tDur').textContent = fmtT(el.duration); }
     updatePosition(el);
   });
@@ -581,6 +594,7 @@ slots.forEach((s) => {
   });
   el.addEventListener('pause', () => {
     refreshPP();
+    if (s === active && !el.ended) saveState(true);
     if (s !== active || el.ended || !el.src || unlocking) return;
     if (userPaused) { log(`pause at ${fmtT(el.currentTime)} (track ${current + 1}) asked by you`); return; }
     interrupted = true; health.sysPauses++;                // nobody in this app asked for it: another app, a call or iOS itself
@@ -766,7 +780,43 @@ $('qrun').onclick = async () => {
   btn.disabled = false;
 };
 
-runChecks(); refreshList();
+/* ---------- remember where you were, and measure how long iOS keeps the app alive ---------- */
+function saveState(force) {
+  if (!active || current < 0 || !tracks[current]) return;
+  const now = Date.now();
+  if (!force && now - lastSave < 2000) return;
+  lastSave = now;
+  try { localStorage.setItem('spike.last', JSON.stringify({ name: tracks[current].name, time: active.el.currentTime, at: now })); } catch (e) { /* private mode */ }
+}
+function startTimeFor(j) {
+  if (pendingStartAt && pendingStartAt.index === j) { const t = pendingStartAt.time; pendingStartAt = null; return t; }
+  return 0;
+}
+function restoreLast() {
+  let s = null;
+  try { s = JSON.parse(localStorage.getItem('spike.last') || 'null'); } catch (e) { /* ignore */ }
+  const i = s ? tracks.findIndex((h) => h.name === s.name) : -1;
+  if (i < 0) return;
+  restore = { index: i, time: s.time || 0 };
+  const m = metas[i] || { tags: {} };
+  $('nowTitle').textContent = m.tags.TITLE || tracks[i].name;
+  $('nowSub').textContent = [m.tags.ARTIST, m.tags.ALBUM].filter(Boolean).join(' · ') + `  ·  saved position ${fmtT(restore.time)}: tap Play to continue`;
+  $('tCur').textContent = fmtT(restore.time);
+  $('tDur').textContent = m.duration ? fmtT(m.duration) : '0:00';
+  if (m.duration) setSeekUI(Math.min(restore.time / m.duration, 1));
+  markCurrent(i);
+  log(`restored the last session: "${tracks[i].name}" at ${fmtT(restore.time)}`);
+}
+try {
+  const alive = +localStorage.getItem('spike.alive');
+  log('app started' + (alive ? `; the previous session was last alive ${Math.round((Date.now() - alive) / 1000)} s ago (a long gap while you were away means iOS had frozen or closed it)` : ''));
+} catch (e) { /* ignore */ }
+for (const ev of ['freeze', 'resume']) document.addEventListener(ev, () => log('page lifecycle: ' + ev));
+window.addEventListener('pagehide', (e) => { log('pagehide (persisted=' + e.persisted + ')'); saveState(true); });
+window.addEventListener('pageshow', (e) => log('pageshow (persisted=' + e.persisted + ')'));
+document.addEventListener('visibilitychange', () => { if (document.hidden) saveState(true); });
+
+runChecks(); refreshList().then(restoreLast);
 window.__spike = { importFiles, goto, step, refreshList, runChecks, slots, health, state: () => ({ current, wanted, active: active ? active.n : null, pending: pendingSwitch ? pendingSwitch.j : null, indexes: slots.map((s) => s.index), playing: slots.map((s) => !s.el.paused) }) };
 </script>
 </body>
