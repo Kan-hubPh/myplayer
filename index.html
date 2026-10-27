@@ -45,7 +45,7 @@
 <body>
 <h1>Player Spike</h1>
 <p>Phase 0 test page. Nothing here is sent anywhere. Files you import stay on this device.</p>
-<p id="build">Build v8: reopening continues where you stopped, shows how long iOS keeps the app alive, audio quality check</p>
+<p id="build">Build v9: resume-after-pause fallbacks (new audio element, Audio Session API, keep-alive experiment), reopening continues where you stopped</p>
 
 <section>
   <h2 style="margin-top:0">1. Environment checks</h2>
@@ -70,7 +70,7 @@
   <div id="seek" role="slider" aria-label="Seek" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div class="rail"></div><div id="seekFill"></div><div id="seekKnob"></div></div>
   <div class="times"><span id="tCur">0:00</span><span id="tDur">0:00</span></div>
   <div class="row" style="margin-top:10px"><button id="prev">Previous</button><button id="pp" class="w">Play</button><button id="next">Next</button></div>
-  <div class="row" style="margin-top:8px"><button id="mem">Preload in memory: on</button><button id="auto">Auto-play next: on</button></div>
+  <div class="row" style="margin-top:8px"><button id="mem">Preload in memory: on</button><button id="auto">Auto-play next: on</button><button id="ka">Keep alive while paused (experiment): off</button></div>
   <audio id="a0" preload="auto" playsinline></audio>
   <audio id="a1" preload="auto" playsinline></audio>
   <audio id="a2" preload="auto" playsinline></audio>
@@ -118,6 +118,7 @@ async function runChecks() {
   const flac = document.createElement('audio').canPlayType('audio/flac');
   add('FLAC playback', flac || 'no', flac ? 'ok' : 'bad');
   add('Media session (lock screen controls)', 'mediaSession' in navigator ? 'available' : 'missing', 'mediaSession' in navigator ? 'ok' : 'warn');
+  add('Audio Session API', navigator.audioSession ? `available (type ${navigator.audioSession.type}, state ${navigator.audioSession.state})` : 'not available', navigator.audioSession ? 'ok' : 'warn');
   if (navigator.storage && navigator.storage.persisted) {
     const p = await navigator.storage.persisted();
     add('Persistent storage granted', p ? 'yes' : 'no', p ? 'ok' : 'warn');
@@ -263,10 +264,10 @@ const slots = [0, 1, 2].map((n) => ({ el: $('a' + n), n, index: -1, token: 0, ur
 let active = null, current = -1, wanted = -1, autoNext = true, mem = true;
 let pendingSwitch = null, userPaused = false, interrupted = false, hbCount = 0;
 let restore = null, pendingStartAt = null, lastSave = 0;     // where the last session stopped, so reopening the app can continue there
-const health = { stalls: 0, errors: 0, sysPauses: 0, failedSwitches: 0, interruptions: 0, reloads: 0 };
+const health = { stalls: 0, errors: 0, sysPauses: 0, failedSwitches: 0, interruptions: 0, reloads: 0, resumeFailures: 0 };
 function updateHealth() {
   const e = $('health');
-  if (e) e.textContent = `Playback health since launch: stalls ${health.stalls} · errors ${health.errors} · paused by the system ${health.sysPauses} · failed track changes ${health.failedSwitches} · reloads ${health.reloads}`;
+  if (e) e.textContent = `Playback health since launch: stalls ${health.stalls} · errors ${health.errors} · paused by the system ${health.sysPauses} · failed track changes ${health.failedSwitches} · reloads ${health.reloads} · failed resumes ${health.resumeFailures}`;
 }
 const wd = { slot: null, time: -1, stuck: 0 };      // watchdog: is the active player really advancing?
 let unlockP = null, unlocked = false, unlocking = false, dragging = false, lastPos = 0, loadTimer = null;
@@ -458,9 +459,10 @@ function togglePlay(want) {
   if (want) {
     if (el.readyState < 2 && active.url) { log('track data was lost while away; reloading before play'); health.reloads++; reloadActive(true); }
     else el.play().catch((e) => log('play() rejected: ' + e));
-    const t0 = el.currentTime;                       // check shortly after that Play really made sound
-    setTimeout(() => log('resume check: ' + (el.paused ? 'STILL PAUSED' : (el.currentTime > t0 + 0.2 ? 'advancing' : 'NOT advancing yet') + ` (readyState=${el.readyState}, hidden=${document.hidden})`)), 1500);
-  } else el.pause();
+    stopKeepAlive();                                 // after play() has been asked, so the audio session is never released in between
+    const t0 = el.currentTime;                       // check shortly after that Play really made sound, and fall back if not
+    setTimeout(() => verifyResume(t0), 1300);
+  } else { el.pause(); startKeepAlive(); }
 }
 function refreshPP() {
   const playing = !!active && !active.el.paused;
@@ -540,7 +542,11 @@ function setupMediaSession() {
   const set = (a, fn) => { try { ms.setActionHandler(a, fn); } catch (e) { /* unsupported action */ } };
   const state = () => `hidden=${document.hidden}, playing=${!!active && !active.el.paused}`;
   set('play', () => { log('remote play (' + state() + ')'); togglePlay(true); });
-  set('pause', () => { log('remote pause (' + state() + ')'); togglePlay(false); });
+  set('pause', () => {
+    log('remote pause (' + state() + ')');
+    if (keepAlive.running) { log('keep-alive is running, so the pause button was pressed on a paused player: treating it as Play'); togglePlay(true); }
+    else togglePlay(false);
+  });
   set('previoustrack', () => { log('remote previous (' + state() + ')'); step(-1); });
   set('nexttrack', () => { log('remote next (' + state() + ')'); step(1); });
   set('seekto', (d) => { if (active && d && d.seekTime != null) active.el.currentTime = d.seekTime; });
@@ -550,6 +556,72 @@ function setupMediaSession() {
 function updatePosition(el) {
   if (!('mediaSession' in navigator) || !navigator.mediaSession.setPositionState || !isFinite(el.duration)) return;
   try { navigator.mediaSession.setPositionState({ duration: el.duration, playbackRate: 1, position: Math.min(el.currentTime, el.duration) }); } catch (e) { /* ignore */ }
+}
+
+/* ---------- Audio Session API (Safari): ask for "playback" and log every state change ---------- */
+function setupAudioSession() {
+  const as = navigator.audioSession;
+  if (!as) { log('audioSession API: not available in this browser'); return; }
+  try { as.type = 'playback'; } catch (e) { log('audioSession.type failed: ' + e); }
+  log(`audioSession: type=${as.type}, state=${as.state}`);
+  if (as.addEventListener) as.addEventListener('statechange', () => log(`audioSession state -> ${as.state} (hidden=${document.hidden})`));
+}
+
+/* ---------- starting sound again after a pause in the background ----------
+   Strategy 1 is a plain play(). If the sound does not advance (iOS can accept play() and stay silent while
+   the page is hidden), strategy 2 builds a brand-new audio element for the same track at the same position. */
+let resumeFallbackBusy = false;
+function verifyResume(t0) {
+  if (userPaused || !active) return;
+  const el = active.el;
+  const ok = !el.paused && el.currentTime > t0 + 0.2;
+  log('resume check: ' + (ok ? 'advancing' : (el.paused ? 'STILL PAUSED' : 'NOT advancing yet')) + ` (readyState=${el.readyState}, hidden=${document.hidden})`);
+  if (!ok && !resumeFallbackBusy) resumeOnFreshElement(Math.max(el.currentTime, t0));
+}
+function freshElement(s) {
+  const old = s.el;
+  const el = document.createElement('audio');
+  el.preload = 'auto'; el.setAttribute('playsinline', '');
+  old.replaceWith(el);
+  try { old.pause(); old.removeAttribute('src'); old.load(); } catch (e) { /* ignore */ }
+  s.el = el; wire(s);
+  return el;
+}
+function resumeOnFreshElement(pos) {
+  const s = active;
+  if (!s || !s.url) return;
+  resumeFallbackBusy = true;
+  log(`resume strategy 2: brand-new audio element for the same track at ${fmtT(pos)} (hidden=${document.hidden})`);
+  const el = freshElement(s);
+  el.addEventListener('loadedmetadata', () => {
+    el.currentTime = pos;
+    el.play().then(() => log('new element: play() resolved'), (e) => log('new element: play() rejected: ' + e));
+  }, { once: true });
+  el.src = s.url; el.load();
+  setTimeout(() => {
+    const ok = !el.paused && el.currentTime > pos + 0.2;
+    log('new element check: ' + (ok ? 'ADVANCING, strategy 2 works here' : 'NOT advancing, strategy 2 failed too') + ` (hidden=${document.hidden})`);
+    if (!ok) health.resumeFailures++;
+    resumeFallbackBusy = false; refreshPP();
+  }, 2000);
+}
+
+/* Experiment (off by default): while paused, play silence so iOS keeps the audio session and the app alive. */
+const keepAlive = { enabled: false, el: null, timer: null, running: false };
+function startKeepAlive() {
+  if (!keepAlive.enabled || keepAlive.running) return;
+  if (!keepAlive.el) { keepAlive.el = document.createElement('audio'); keepAlive.el.loop = true; keepAlive.el.setAttribute('playsinline', ''); keepAlive.el.src = silentWav(); }
+  keepAlive.running = true;
+  keepAlive.el.play().then(() => log('keep-alive: silent audio is running while paused'), (e) => { keepAlive.running = false; log('keep-alive rejected: ' + e); });
+  try { navigator.mediaSession.playbackState = 'paused'; } catch (e) { /* ignore */ }
+  clearTimeout(keepAlive.timer);
+  keepAlive.timer = setTimeout(stopKeepAlive, 180000);   // never longer than 3 minutes
+}
+function stopKeepAlive() {
+  if (!keepAlive.running) return;
+  keepAlive.running = false; clearTimeout(keepAlive.timer);
+  keepAlive.el.pause();
+  log('keep-alive: stopped');
 }
 
 /* ---------- seek bar: tap anywhere to jump, drag to scrub ---------- */
@@ -577,7 +649,7 @@ seek.addEventListener('pointercancel', () => { dragging = false; });
 
 /* ---------- element events ---------- */
 let lastSeekLog = 0;
-slots.forEach((s) => {
+function wire(s) {
   const el = s.el;
   el.addEventListener('ended', () => onEnded(s));
   el.addEventListener('timeupdate', () => {
@@ -609,7 +681,8 @@ slots.forEach((s) => {
     });
   }
   el.addEventListener('seeked', () => { if (s !== active) return; const n = Date.now(); if (n - lastSeekLog > 800) { lastSeekLog = n; log(`seeked to ${fmtT(el.currentTime)}`); } });
-});
+}
+slots.forEach(wire);
 document.addEventListener('visibilitychange', () => {
   const playing = slots.filter((s) => !s.el.paused).length;
   log('page ' + document.visibilityState + ', ' + playing + ' player(s) playing' + (active ? ', active at ' + fmtT(active.el.currentTime) : ''));
@@ -618,6 +691,7 @@ $('prev').onclick = () => step(-1);
 $('next').onclick = () => step(1);
 $('pp').onclick = () => { unlock(); togglePlay(); };
 $('auto').onclick = () => { autoNext = !autoNext; $('auto').textContent = 'Auto-play next: ' + (autoNext ? 'on' : 'off'); };
+$('ka').onclick = () => { keepAlive.enabled = !keepAlive.enabled; if (!keepAlive.enabled) stopKeepAlive(); $('ka').textContent = 'Keep alive while paused (experiment): ' + (keepAlive.enabled ? 'on' : 'off'); log('keep-alive experiment ' + (keepAlive.enabled ? 'ENABLED' : 'disabled')); };
 $('mem').onclick = () => {
   mem = !mem; $('mem').textContent = 'Preload in memory: ' + (mem ? 'on' : 'off');
   for (const s of slots) if (s !== active) { s.token++; s.index = -1; }
@@ -816,6 +890,7 @@ window.addEventListener('pagehide', (e) => { log('pagehide (persisted=' + e.pers
 window.addEventListener('pageshow', (e) => log('pageshow (persisted=' + e.persisted + ')'));
 document.addEventListener('visibilitychange', () => { if (document.hidden) saveState(true); });
 
+setupAudioSession();
 runChecks(); refreshList().then(restoreLast);
 window.__spike = { importFiles, goto, step, refreshList, runChecks, slots, health, state: () => ({ current, wanted, active: active ? active.n : null, pending: pendingSwitch ? pendingSwitch.j : null, indexes: slots.map((s) => s.index), playing: slots.map((s) => !s.el.paused) }) };
 </script>
