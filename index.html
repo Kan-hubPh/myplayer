@@ -45,7 +45,7 @@
 <body>
 <h1>Player Spike</h1>
 <p>Phase 0 test page. Nothing here is sent anywhere. Files you import stay on this device.</p>
-<p id="build">Build v9: resume-after-pause fallbacks (new audio element, Audio Session API, keep-alive experiment), reopening continues where you stopped</p>
+<p id="build">Build v10: resume-after-pause fallbacks (new audio element, Audio Session API, keep-alive experiment), reopening continues where you stopped; app files are fetched fresh on every launch</p>
 
 <section>
   <h2 style="margin-top:0">1. Environment checks</h2>
@@ -88,7 +88,7 @@
   <h2 style="margin-top:0">5. Event log</h2>
   <p>Lock the screen or switch apps while a track plays, then come back and read this log.</p>
   <pre id="log"></pre>
-  <div class="row" style="margin-top:8px"><button id="copy">Copy report</button></div>
+  <div class="row" style="margin-top:8px"><button id="copy">Copy report</button> <button id="refresh">Update app now</button></div>
 </section>
 
 <script>
@@ -141,9 +141,18 @@ async function logStorage(tag) {
 }
 
 if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('sw.js').then(() => log('service worker registered'), (e) => log('service worker failed: ' + e));
+  navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }).then((r) => { log('service worker registered'); r.update().catch(() => {}); }, (e) => log('service worker failed: ' + e));
   navigator.serviceWorker.addEventListener('controllerchange', runChecks);
+  caches.keys().then((ks) => log('app cache: ' + (ks.join(', ') || 'none'))).catch(() => {});
 }
+// Drops the app files and the service worker (never the imported songs in OPFS), then loads everything again from the network.
+document.getElementById('refresh').onclick = async () => {
+  try {
+    for (const r of await navigator.serviceWorker.getRegistrations()) await r.unregister();
+    for (const k of await caches.keys()) await caches.delete(k);
+  } catch (e) { log('update failed: ' + e); }
+  location.replace(location.pathname + '?u=' + Date.now());
+};
 
 /* ---------- 2. import (worker writes into OPFS) ---------- */
 let worker, importStart = 0;
