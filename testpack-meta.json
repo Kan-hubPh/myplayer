@@ -1,0 +1,65 @@
+{
+  "01 Poem.flac": {
+    "sha256": "64843c36f834b99020d01ee161b4f0ec4a838559da4c98378b5e6bcec8069a79",
+    "flac_md5": "39ba64846cca08d739669353aedaf127",
+    "sample_rate": 44100,
+    "bits": 24,
+    "samples": 9938949,
+    "peak_dbfs": -0.2174,
+    "rms_dbfs": -20.1965
+  },
+  "02 River Flows In You.flac": {
+    "sha256": "daff26dc12ee057d034d3f2ef19d1274cc2f8673893d6c0ef6e835b33de78662",
+    "flac_md5": "bab73eeb389bad22501f80ee88293da0",
+    "sample_rate": 44100,
+    "bits": 24,
+    "samples": 9626721,
+    "peak_dbfs": -0.9038,
+    "rms_dbfs": -19.1468
+  },
+  "03 Chaconne.flac": {
+    "sha256": "d51a6484660f4c3ce004547fffa671c35ba228cf449937bc300eaec032236821",
+    "flac_md5": "794f26ab2c0252abf7fe989d1119cc33",
+    "sample_rate": 44100,
+    "bits": 24,
+    "samples": 11069673,
+    "peak_dbfs": -0.2239,
+    "rms_dbfs": -19.7115
+  },
+  "04 Kiss the Rain.flac": {
+    "sha256": "be0573e84d6d68369942b2c060c735422a51bd5c38cfc4b95870bc489ba27b86",
+    "flac_md5": "fc740cf39c11e294f6807388ae3ee5d7",
+    "sample_rate": 44100,
+    "bits": 24,
+    "samples": 13248213,
+    "peak_dbfs": -0.1313,
+    "rms_dbfs": -20.4204
+  },
+  "05 May Be.flac": {
+    "sha256": "f74d37a369ffcf4fb9aa4d4fb8f9af0f9bf414a73a521a1191f2bc22b2ea32cb",
+    "flac_md5": "53a8227f19cc49c35f272c60878fc1d4",
+    "sample_rate": 44100,
+    "bits": 24,
+    "samples": 13503420,
+    "peak_dbfs": -0.1308,
+    "rms_dbfs": -19.7395
+  },
+  "06 Do You.flac": {
+    "sha256": "5a90f04052335179c372dbbc9e0e98ef317384749bf3e9ca564b2bada3eb0781",
+    "flac_md5": "34f8168dd4a68c42eeb07d6435ebb92c",
+    "sample_rate": 44100,
+    "bits": 24,
+    "samples": 12917199,
+    "peak_dbfs": -0.2726,
+    "rms_dbfs": -20.4016
+  },
+  "07 Passing By.flac": {
+    "sha256": "64f93a8964012c6dc1359769e98407d8b5118138f2e595f216b8c4efac932b30",
+    "flac_md5": "2f4e4d63f15bbb77cc93ab784b5a46c7",
+    "sample_rate": 44100,
+    "bits": 24,
+    "samples": 11647119,
+    "peak_dbfs": -0.2639,
+    "rms_dbfs": -18.7239
+  }
+}

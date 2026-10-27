@@ -38,12 +38,14 @@
   #seekKnob { position:absolute; top:13px; width:18px; height:18px; margin-left:-9px; background:#fff; border-radius:50%; left:0; }
   .times { display:flex; justify-content:space-between; font-size:12px; color:var(--dim); }
   #pp { min-width:96px; }
+  select { background:#2a2a2a; color:#fff; border:0; border-radius:8px; padding:10px; font-size:15px; max-width:100%; }
+  button:disabled { opacity:.5; }
 </style>
 </head>
 <body>
 <h1>Player Spike</h1>
 <p>Phase 0 test page. Nothing here is sent anywhere. Files you import stay on this device.</p>
-<p id="build">Build v5: sound never stops between tracks (new track starts before the old one stops), instant lock screen next/previous</p>
+<p id="build">Build v6: failed track changes never silence the app, recovery after another app takes the audio, audio quality check</p>
 
 <section>
   <h2 style="margin-top:0">1. Environment checks</h2>
@@ -75,7 +77,15 @@
 </section>
 
 <section>
-  <h2 style="margin-top:0">4. Event log</h2>
+  <h2 style="margin-top:0">4. Audio quality check</h2>
+  <p>Checks that the copy inside this app is identical to the original, that this device decodes it without changing a sample, and how loud and clean the signal is. It cannot measure the speaker itself.</p>
+  <div class="row"><select id="qsel"></select><button id="qrun" class="w">Check this track</button></div>
+  <pre id="qout">Not run yet.</pre>
+  <p id="health" style="font-size:12px"></p>
+</section>
+
+<section>
+  <h2 style="margin-top:0">5. Event log</h2>
   <p>Lock the screen or switch apps while a track plays, then come back and read this log.</p>
   <pre id="log"></pre>
   <div class="row" style="margin-top:8px"><button id="copy">Copy report</button></div>
@@ -235,6 +245,7 @@ async function refreshList() {
     d.querySelector('.x').onclick = () => getWorker().postMessage({ type: 'remove', name: h.name });
     el.appendChild(d);
   });
+  fillQsel();
 }
 function markCurrent(i) {
   document.querySelectorAll('#list .track').forEach((d, k) => d.classList.toggle('on', k === i));
@@ -250,6 +261,13 @@ function markCurrent(i) {
 const MEM_LIMIT = 90 * 1048576;                    // bigger files are streamed from storage instead of copied into memory
 const slots = [0, 1, 2].map((n) => ({ el: $('a' + n), n, index: -1, token: 0, url: null, ready: false, readyP: Promise.resolve(false) }));
 let active = null, current = -1, wanted = -1, autoNext = true, mem = true;
+let pendingSwitch = null, userPaused = false, interrupted = false, hbCount = 0;
+const health = { stalls: 0, errors: 0, sysPauses: 0, failedSwitches: 0, interruptions: 0, reloads: 0 };
+function updateHealth() {
+  const e = $('health');
+  if (e) e.textContent = `Playback health since launch: stalls ${health.stalls} · errors ${health.errors} · paused by the system ${health.sysPauses} · failed track changes ${health.failedSwitches} · reloads ${health.reloads}`;
+}
+const wd = { slot: null, time: -1, stuck: 0 };      // watchdog: is the active player really advancing?
 let unlockP = null, unlocked = false, unlocking = false, dragging = false, lastPos = 0, loadTimer = null;
 
 function silentWav() {
@@ -323,23 +341,62 @@ function pickVictim(j) {
   return slots.find((s) => s !== active && !keep.includes(s.index)) || slots.find((s) => s !== active);
 }
 
-/* Make before break: the new track is started FIRST and the old one is stopped afterwards, so sound never
-   stops completely. (On iOS a page that makes no sound in the background is suspended within seconds,
-   and then nothing can start any more.) When the target is already loaded the swap happens synchronously,
-   inside the lock screen / tap event that asked for it. If it is not loaded yet, the current track keeps playing. */
+/* Make before break, and never let go of a sound that works. While a track is playing, the new one is started
+   MUTED ("pre-roll") and the old one keeps playing. Only when the new element really advances (timeupdate) is
+   it unmuted and the old one stopped. If it does not advance within 2 s (iOS can refuse to load or start media
+   in the background) the attempt is cancelled and the old track simply keeps playing: sound is never lost to a
+   failed track change. (On iOS a page that makes no sound in the background is suspended within seconds.) */
 function switchTo(s, j, ended) {
+  abortPending();
   const old = active;
+  const oldPlaying = !!old && old !== s && !old.el.paused && !ended;
   s.el.currentTime = 0;
+  if (oldPlaying) {
+    s.el.muted = true;
+    pendingSwitch = { s, j, old, timer: setTimeout(() => failPending('no progress in 2 s'), 2000) };
+    log(`switch to track ${j + 1}: pre-roll (hidden=${document.hidden}, readyState=${s.el.readyState})`);
+    s.el.play().catch((e) => failPending('play() rejected: ' + e));
+    return;
+  }
+  s.el.muted = false;                                // nothing is playing (track ended, paused, first start): start directly
   const p = s.el.play();
   active = s; current = j; wanted = j;
-  if (old && old !== s && !ended) old.el.pause();
   showNow(j); markCurrent(j); refreshPP();
   p.then(() => { if (ended) log('next track started'); afterStart(); },
     (e) => { log('play() rejected: ' + e + ' (track ' + (j + 1) + ')'); refreshPP(); });
 }
+function commitPending() {
+  const ps = pendingSwitch;
+  if (!ps) return;
+  clearTimeout(ps.timer); pendingSwitch = null;
+  ps.s.el.muted = false;
+  active = ps.s; current = ps.j; wanted = ps.j;
+  if (ps.old && ps.old !== ps.s) ps.old.el.pause();
+  showNow(ps.j); markCurrent(ps.j); refreshPP();
+  afterStart();
+}
+function abortPending() {
+  const ps = pendingSwitch;
+  if (!ps) return;
+  clearTimeout(ps.timer); pendingSwitch = null;
+  ps.s.el.pause(); ps.s.el.muted = false;
+}
+function failPending(why) {
+  const ps = pendingSwitch;
+  if (!ps) return;
+  log(`switch to track ${ps.j + 1} failed (${why}); keeping track ${current + 1}`);
+  health.failedSwitches++;
+  abortPending();
+  ps.s.ready = false;
+  if (ps.old && ps.old.el.paused && !userPaused) ps.old.el.play().catch(() => {});   // the system may have paused it when the new one started
+  wanted = current; if (current >= 0) { showNow(current); markCurrent(current); }
+  refreshPP();
+  if (!document.hidden && ps.s.index === ps.j) startLoad(ps.s, ps.j);                // try to load it again while the page is visible
+}
 /* move toward `wanted`: swap at once if loaded, otherwise load it (only the latest target) and swap when ready */
 function settle() {
   if (wanted < 0 || wanted === current) return;
+  if (pendingSwitch && pendingSwitch.j === wanted) return;    // this move is already under way
   const t = slotFor(wanted);
   if (t && t.ready) { switchTo(t, wanted); return; }
   clearTimeout(loadTimer);
@@ -392,7 +449,11 @@ function togglePlay(want) {
   if (!active) { if (tracks.length) goto(0); return; }
   const el = active.el;
   if (want === undefined) want = el.paused;
-  if (want) el.play().catch((e) => log('play() rejected: ' + e)); else el.pause();
+  userPaused = !want;
+  if (want) {
+    if (el.readyState < 2 && active.url) { log('track data was lost while away; reloading before play'); health.reloads++; reloadActive(true); }
+    else el.play().catch((e) => log('play() rejected: ' + e));
+  } else el.pause();
 }
 function refreshPP() {
   const playing = !!active && !active.el.paused;
@@ -411,9 +472,49 @@ function onEnded(s) {
   if (n && n.ready) switchTo(n, wanted, true);
   else { log('next track was not ready, loading now'); showNow(wanted); settle(); }
 }
-/* safety net: if a move to `wanted` got lost, try again; when the page returns, show the real state */
-setInterval(() => { if (wanted >= 0 && wanted !== current && !loadTimer) settle(); }, 2000);
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') { refreshPP(); settle(); } });
+/* Reloads the active track from its in-memory copy and goes back to where it was; plays on if `resume` is true. */
+function reloadActive(resume) {
+  const s = active;
+  if (!s || !s.url) return;
+  const t = s.el.currentTime;
+  const back = () => { s.el.removeEventListener('loadedmetadata', back); s.el.currentTime = t; if (resume) s.el.play().catch((e) => log('play() rejected: ' + e)); refreshPP(); };
+  s.el.addEventListener('loadedmetadata', back);
+  s.el.src = s.url; s.el.load();
+}
+/* The page is visible again. If another app (YouTube, a call...) took the audio away, leave the player in a clean,
+   paused state at the same position instead of half-loaded, ready for one tap on Play. */
+function recoverOnReturn() {
+  refreshPP();
+  if (!active) return;
+  const el = active.el;
+  if (interrupted && !userPaused) {
+    log(`back in the app after an interruption: paused=${el.paused}, readyState=${el.readyState}`);
+    if (!el.paused) el.pause();
+    if (el.readyState < 3) reloadActive(false);
+    health.interruptions++;
+  }
+  interrupted = false; wd.stuck = 0;
+  refreshPP(); settle();
+}
+/* Every second: stop stray players, retry a lost move, and check that the active player really advances. */
+setInterval(() => {
+  for (const s of slots) {
+    if (s !== active && !(pendingSwitch && pendingSwitch.s === s) && !s.el.paused && !unlocking) { s.el.pause(); log(`swept a stray player (slot ${s.n})`); }
+  }
+  if (wanted >= 0 && wanted !== current && !loadTimer && !pendingSwitch) settle();
+  const a = active && active.el;
+  if (!a || a.paused || a.ended || a.seeking || pendingSwitch || userPaused) { wd.stuck = 0; wd.slot = null; }
+  else {
+    if (wd.slot === active && Math.abs(a.currentTime - wd.time) < 0.05) wd.stuck++; else wd.stuck = 0;
+    wd.slot = active; wd.time = a.currentTime;
+    if (wd.stuck === 3) { log(`active player is not advancing at ${fmtT(a.currentTime)} (hidden=${document.hidden}, readyState=${a.readyState}); calling play() again`); a.play().catch((e) => log('play() rejected: ' + e)); }
+    if (wd.stuck === 6) { log('still not advancing; reloading the track from memory'); health.reloads++; reloadActive(true); }
+  }
+  if (document.hidden && ++hbCount % 5 === 0 && a) log(`heartbeat (hidden): active at ${fmtT(a.currentTime)}, ${a.paused ? 'paused' : 'playing'}, readyState=${a.readyState}`);
+  updateHealth();
+}, 1000);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') recoverOnReturn(); });
+window.addEventListener('pageshow', () => { if (!document.hidden) recoverOnReturn(); });
 
 function setupMediaSession() {
   if (!('mediaSession' in navigator) || current < 0) return;
@@ -425,10 +526,11 @@ function setupMediaSession() {
     });
   } catch (e) { log('metadata failed: ' + e); }
   const set = (a, fn) => { try { ms.setActionHandler(a, fn); } catch (e) { /* unsupported action */ } };
-  set('play', () => togglePlay(true));
-  set('pause', () => togglePlay(false));
-  set('previoustrack', () => step(-1));
-  set('nexttrack', () => step(1));
+  const state = () => `hidden=${document.hidden}, playing=${!!active && !active.el.paused}`;
+  set('play', () => { log('remote play (' + state() + ')'); togglePlay(true); });
+  set('pause', () => { log('remote pause (' + state() + ')'); togglePlay(false); });
+  set('previoustrack', () => { log('remote previous (' + state() + ')'); step(-1); });
+  set('nexttrack', () => { log('remote next (' + state() + ')'); step(1); });
   set('seekto', (d) => { if (active && d && d.seekTime != null) active.el.currentTime = d.seekTime; });
   set('seekbackward', null);                       // makes iOS show previous/next instead of -10 s / +10 s
   set('seekforward', null);
@@ -467,18 +569,30 @@ slots.forEach((s) => {
   const el = s.el;
   el.addEventListener('ended', () => onEnded(s));
   el.addEventListener('timeupdate', () => {
+    if (pendingSwitch && pendingSwitch.s === s && el.currentTime > 0.05) commitPending();
     if (s !== active || dragging) return;
     if (isFinite(el.duration) && el.duration) { setSeekUI(el.currentTime / el.duration); $('tCur').textContent = fmtT(el.currentTime); $('tDur').textContent = fmtT(el.duration); }
     updatePosition(el);
   });
   el.addEventListener('play', () => {
-    if (!unlocking && s !== active) { el.pause(); log(`stopped a stray player (slot ${s.n})`); }
+    if (!unlocking && s !== active && !(pendingSwitch && pendingSwitch.s === s)) { el.pause(); log(`stopped a stray player (slot ${s.n})`); }
+    if (s === active) { userPaused = false; interrupted = false; }
     refreshPP();
   });
-  el.addEventListener('pause', () => { refreshPP(); if (s === active && !el.ended && el.src) log(`pause at ${fmtT(el.currentTime)} (track ${current + 1})`); });
+  el.addEventListener('pause', () => {
+    refreshPP();
+    if (s !== active || el.ended || !el.src || unlocking) return;
+    if (userPaused) { log(`pause at ${fmtT(el.currentTime)} (track ${current + 1}) asked by you`); return; }
+    interrupted = true; health.sysPauses++;                // nobody in this app asked for it: another app, a call or iOS itself
+    log(`PAUSED BY THE SYSTEM at ${fmtT(el.currentTime)} (track ${current + 1}, hidden=${document.hidden}): another app probably took the audio`);
+  });
   el.addEventListener('loadedmetadata', () => { if (s === active) $('tDur').textContent = fmtT(el.duration); });
   for (const ev of ['stalled', 'error']) {
-    el.addEventListener(ev, () => { if (s === active || ev === 'error') log(`${ev} (slot ${s.n}) at ${fmtT(el.currentTime)}` + (ev === 'error' && el.error ? ' ' + el.error.message : '')); });
+    el.addEventListener(ev, () => {
+      if (s === active && ev === 'stalled') health.stalls++;
+      if (ev === 'error') health.errors++;
+      if (s === active || ev === 'error') log(`${ev} (slot ${s.n}) at ${fmtT(el.currentTime)}` + (ev === 'error' && el.error ? ' ' + el.error.message : ''));
+    });
   }
   el.addEventListener('seeked', () => { if (s !== active) return; const n = Date.now(); if (n - lastSeekLog > 800) { lastSeekLog = n; log(`seeked to ${fmtT(el.currentTime)}`); } });
 });
@@ -500,12 +614,160 @@ window.addEventListener('offline', () => { log('network offline'); runChecks(); 
 
 /* ---------- 4. report ---------- */
 $('copy').onclick = async () => {
-  const text = Array.from($('checks').rows).map((r) => r.cells[0].textContent + ': ' + r.cells[1].textContent).join('\n') + '\n\n' + logEl.textContent;
+  const text = $('build').textContent + '\n\n' + Array.from($('checks').rows).map((r) => r.cells[0].textContent + ': ' + r.cells[1].textContent).join('\n') + '\n\n' + $('health').textContent + '\n\n' + $('qout').textContent + '\n\n' + logEl.textContent;
   try { await navigator.clipboard.writeText(text); log('report copied'); } catch (e) { log('copy failed: ' + e); }
 };
 
+/* ---------- audio quality check ---------- */
+let refMeta = null;
+fetch('testpack-meta.json', { cache: 'no-store' }).then((r) => (r.ok ? r.json() : null)).then((j) => { refMeta = j; }).catch(() => { /* optional reference data */ });
+
+function fillQsel() {
+  const sel = $('qsel');
+  if (!sel) return;
+  sel.innerHTML = '';
+  tracks.forEach((h, i) => { const o = document.createElement('option'); o.value = i; o.textContent = (metas[i] && metas[i].tags.TITLE) || h.name; sel.appendChild(o); });
+}
+
+/* Streaming MD5 (the FLAC format stores an MD5 of the decoded audio; Web Crypto has no MD5). */
+function Md5() {
+  const K = new Uint32Array(64), S = [7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+    4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21];
+  for (let i = 0; i < 64; i++) K[i] = Math.floor(Math.abs(Math.sin(i + 1)) * 4294967296);
+  let a0 = 0x67452301, b0 = 0xefcdab89, c0 = 0x98badcfe, d0 = 0x10325476;
+  const buf = new Uint8Array(64), M = new Uint32Array(16);
+  let bl = 0, total = 0;
+  function block(p) {
+    for (let i = 0; i < 16; i++) M[i] = p[i * 4] | (p[i * 4 + 1] << 8) | (p[i * 4 + 2] << 16) | (p[i * 4 + 3] << 24);
+    let A = a0, B = b0, C = c0, D = d0;
+    for (let i = 0; i < 64; i++) {
+      let F, g;
+      if (i < 16) { F = (B & C) | (~B & D); g = i; }
+      else if (i < 32) { F = (D & B) | (~D & C); g = (5 * i + 1) % 16; }
+      else if (i < 48) { F = B ^ C ^ D; g = (3 * i + 5) % 16; }
+      else { F = C ^ (B | ~D); g = (7 * i) % 16; }
+      F = (F + A + K[i] + M[g]) >>> 0;
+      A = D; D = C; C = B;
+      B = (B + ((F << S[i]) | (F >>> (32 - S[i])))) >>> 0;
+    }
+    a0 = (a0 + A) >>> 0; b0 = (b0 + B) >>> 0; c0 = (c0 + C) >>> 0; d0 = (d0 + D) >>> 0;
+  }
+  function update(data) {
+    total += data.length;
+    let p = 0;
+    if (bl) { while (bl < 64 && p < data.length) buf[bl++] = data[p++]; if (bl === 64) { block(buf); bl = 0; } }
+    while (p + 64 <= data.length) { block(data.subarray(p, p + 64)); p += 64; }
+    while (p < data.length) buf[bl++] = data[p++];
+  }
+  let done = null;
+  function hex() {
+    if (done) return done;                       // finishing twice must not change the result
+    const bits = total * 8, padLen = (bl < 56 ? 56 : 120) - bl;
+    const pad = new Uint8Array(padLen + 8);
+    pad[0] = 0x80;
+    const lo = bits >>> 0, hi = Math.floor(bits / 4294967296);
+    for (let i = 0; i < 4; i++) { pad[padLen + i] = (lo >>> (8 * i)) & 255; pad[padLen + 4 + i] = (hi >>> (8 * i)) & 255; }
+    update(pad);
+    let s = '';
+    for (const w of [a0, b0, c0, d0]) for (let i = 0; i < 4; i++) s += ((w >>> (8 * i)) & 255).toString(16).padStart(2, '0');
+    done = s;
+    return s;
+  }
+  return { update, hex };
+}
+const toHex = (u8) => Array.from(u8, (b) => b.toString(16).padStart(2, '0')).join('');
+const dB = (x) => (x > 0 ? 20 * Math.log10(x) : -Infinity);
+function flacInfo(u8) {
+  if (String.fromCharCode(u8[0], u8[1], u8[2], u8[3]) !== 'fLaC') return null;
+  const o = 8;                                   // the first metadata block is always STREAMINFO
+  return {
+    rate: (u8[o + 10] << 12) | (u8[o + 11] << 4) | (u8[o + 12] >> 4),
+    ch: ((u8[o + 12] >> 1) & 7) + 1,
+    bits: (((u8[o + 12] & 1) << 4) | (u8[o + 13] >> 4)) + 1,
+    total: (u8[o + 13] & 15) * 4294967296 + ((u8[o + 14] << 24) >>> 0) + (u8[o + 15] << 16) + (u8[o + 16] << 8) + u8[o + 17],
+    md5: toHex(u8.subarray(o + 18, o + 34))
+  };
+}
+const decodeAudio = (ctx, data) => new Promise((res, rej) => { const r = ctx.decodeAudioData(data, res, rej); if (r && r.then) r.then(res, rej); });
+
+async function qualityCheck(i) {
+  const lines = [];
+  const say = (s) => { lines.push(s); $('qout').textContent = lines.join('\n'); };
+  const problems = [];
+  const file = await tracks[i].getFile();
+  say(`File: ${file.name}  (${fmtMB(file.size)})`);
+  let buf = await file.arrayBuffer();
+  const u8 = new Uint8Array(buf);
+  const ref = refMeta && refMeta[file.name];
+  const sha = toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', buf)));
+  if (ref) { if (ref.sha256 === sha) say('1) Copy in this app vs the original: OK, identical (SHA-256 matches the laptop)'); else { say('1) Copy in this app vs the original: MISMATCH, the copy differs'); problems.push('the imported copy differs from the original'); } }
+  else say(`1) Copy vs original: no reference for this file (checksum ${sha.slice(0, 12)}…)`);
+  const si = flacInfo(u8);
+  if (!si) { say('Not a FLAC file.'); return; }
+  say(`   Stream: ${si.rate} Hz, ${si.bits}-bit, ${si.ch} ch, ${si.total} samples (${fmtT(si.total / si.rate)})`);
+  const AC = window.AudioContext || window.webkitAudioContext;
+  let hw = '?';
+  try { const probe = new AC(); hw = probe.sampleRate; probe.close(); } catch (e) { /* ignore */ }
+  say(`2) Device output rate: ${hw} Hz` + (hw === si.rate ? ' = same as the file, no resampling by the system' : ` differs from the file (${si.rate} Hz): the system resamples when playing`));
+  say('3) Decoding with this device…');
+  let ctx;
+  try { ctx = new AC({ sampleRate: si.rate }); } catch (e) { ctx = new AC(); }
+  const t0d = performance.now();
+  const ab = await decodeAudio(ctx, buf.slice(0));
+  buf = null;
+  const sameShape = ab.sampleRate === si.rate && ab.length === si.total && ab.numberOfChannels === si.ch;
+  say(`   Decoded ${ab.numberOfChannels} ch, ${ab.sampleRate} Hz, ${ab.length} samples in ${((performance.now() - t0d) / 1000).toFixed(1)} s` + (sameShape ? ': same rate and length as the file says' : ': DIFFERENT from the file header'));
+  if (!sameShape) problems.push('the decoder changed the sample rate or length');
+  const bytes = Math.ceil(si.bits / 8), scale = Math.pow(2, si.bits - 1), maxv = scale - 1, minv = -scale;
+  const chans = [];
+  for (let c = 0; c < ab.numberOfChannels; c++) chans.push(ab.getChannelData(c));
+  const md5 = Md5(), CH = 32768, out8 = new Uint8Array(CH * ab.numberOfChannels * bytes);
+  const nch = ab.numberOfChannels, n = ab.length, dc = new Float64Array(nch);
+  let peak = 0, sumsq = 0, clipped = 0;
+  for (let f0 = 0; f0 < n; f0 += CH) {
+    const f1 = Math.min(f0 + CH, n);
+    let o = 0;
+    for (let f = f0; f < f1; f++) {
+      for (let c = 0; c < nch; c++) {
+        const x = chans[c][f];
+        let v = Math.round(x * scale);
+        if (v > maxv) v = maxv; else if (v < minv) v = minv;
+        if (v === maxv || v === minv) clipped++;
+        const ax = x < 0 ? -x : x;
+        if (ax > peak) peak = ax;
+        sumsq += x * x; dc[c] += x;
+        for (let b = 0; b < bytes; b++) out8[o++] = (v >> (8 * b)) & 255;
+      }
+    }
+    md5.update(out8.subarray(0, o));
+    if (((f0 / CH) | 0) % 8 === 0) await new Promise((r) => setTimeout(r, 0));
+  }
+  const got = md5.hex();
+  if (/^0+$/.test(si.md5)) say('4) Decoded samples vs the checksum stored in the file: the file has no checksum');
+  else if (got === si.md5) say('4) Decoded samples vs the checksum stored in the file: OK, every sample is bit-exact');
+  else { say(`4) Decoded samples vs the checksum stored in the file: MISMATCH (got ${got.slice(0, 8)}…, expected ${si.md5.slice(0, 8)}…)`); problems.push('the decoded samples are not bit-exact'); }
+  const rms = Math.sqrt(sumsq / (n * nch));
+  const dcMax = Math.max(...Array.from(dc, (x) => Math.abs(x / n)));
+  say(`5) Level: peak ${dB(peak).toFixed(2)} dBFS, RMS ${dB(rms).toFixed(2)} dBFS, clipped samples ${clipped}, DC offset ${dB(dcMax).toFixed(1)} dBFS`);
+  if (clipped > 0) problems.push(clipped + ' samples sit at full scale (clipping in the recording)');
+  if (ref) {
+    const dp = dB(peak) - ref.peak_dbfs, dr = dB(rms) - ref.rms_dbfs, same = Math.abs(dp) < 0.05 && Math.abs(dr) < 0.05;
+    say(`   vs the laptop's own decode: peak ${dp >= 0 ? '+' : ''}${dp.toFixed(3)} dB, RMS ${dr >= 0 ? '+' : ''}${dr.toFixed(3)} dB` + (same ? ' (matches)' : ' (DIFFERENT)'));
+    if (!same) problems.push('level differs from the laptop decode');
+  }
+  say(problems.length ? 'Result: PROBLEMS FOUND: ' + problems.join('; ') + '.' : 'Result: no distortion found in the stored copy or in this device\'s decoding. The speaker stage cannot be measured by a web page.');
+  try { ctx.close(); } catch (e) { /* ignore */ }
+}
+$('qrun').onclick = async () => {
+  const btn = $('qrun');
+  if (!tracks.length) { $('qout').textContent = 'Import a file first.'; return; }
+  btn.disabled = true;
+  try { await qualityCheck(+$('qsel').value); } catch (e) { $('qout').textContent += '\nCheck failed: ' + e; }
+  btn.disabled = false;
+};
+
 runChecks(); refreshList();
-window.__spike = { importFiles, goto, step, refreshList, runChecks, slots, state: () => ({ current, active: active ? active.n : null, indexes: slots.map((s) => s.index), playing: slots.map((s) => !s.el.paused) }) };
+window.__spike = { importFiles, goto, step, refreshList, runChecks, slots, health, state: () => ({ current, wanted, active: active ? active.n : null, pending: pendingSwitch ? pendingSwitch.j : null, indexes: slots.map((s) => s.index), playing: slots.map((s) => !s.el.paused) }) };
 </script>
 </body>
 </html>
